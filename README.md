@@ -106,6 +106,8 @@ cd worker && ./deploy-worker.sh   # 需 wrangler + Cloudflare 登录
 
 > 标签需为语义化版本（如 `v1.1.0`），版本号会从标签统一注入到应用与产物。
 > 应用按「Release 标签版本 > 应用自报版本」判定更新，因此新版本号必须大于已安装版本。
+> 发版前请在 `docs/releases/<标签>.md` 写好更新说明，Release 正文会用它；
+> 没写也不会报错，只会静默退回成一句 Full Changelog 链接。
 
 ## 开源说明
 
