@@ -1,0 +1,5 @@
+;!@Install@!UTF-8!
+Title="EchOS"
+Progress="no"
+RunProgram="echos.exe"
+;!@InstallEnd@!

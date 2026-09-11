@@ -1,0 +1,212 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:          # 手动触发（Actions 页面按钮）
+    inputs:
+      app_version:            # 手动打包时给版本号；打 v* 标签推送时自动取标签名
+        description: 手动打包版本号（如 v1.0.0；打标签推送时忽略）
+        required: false
+        type: string
+      publish_release:        # 手动打包后是否同时发布 GitHub Release（需填版本号）
+        description: 手动打包后是否同时发布 Release
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags: ['v*']              # 打 v* 标签自动触发（自动发布 Release）
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      # 末尾「清理历史工作流记录」用 gh api 删除旧 run，需要 actions:write。
+      # 只给 contents:write 时该步骤会 403，且因 if: always() 会把整个 job 拖红。
+      actions: write
+    env:
+      # 版本：推送标签 → 标签名；手动 → 填的版本号；否则 dev，避免空名
+      # 用 github.event.inputs 而非 inputs：push 事件下 inputs 上下文不可用，
+      # 直接引用会有 Unrecognized named-value 风险；event.inputs 在 push 下为空串，安全回退。
+      APP_VERSION: ${{ github.event_name == 'push' && github.ref_name || (github.event.inputs.app_version != '' && github.event.inputs.app_version || 'dev') }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup Go (内核)
+        if: hashFiles('third_party/x-tunnel/go.mod') != ''
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: third_party/x-tunnel/go.mod
+
+      - run: flutter pub get
+      # 更新源随仓库自动走（Fork 用 github.repository 指向自己的仓库）。
+      # 版本号同步注入三处，缺一会导致自动更新静默失效（详见 app_version.dart 注释）：
+      #   1) ECHOS_VERSION → 应用自报版本（Updater 判定用）
+      #   2) --build-name  → exe 资源里的产品版本（用于「应用和功能」显示）
+      #   3) ISCC /DAPP_VERSION → 安装包文件名（下面打包步骤用 $env:APP_VERSION）
+      # 标签形如 v1.2.3，这里剥掉前导 v；手动触发填了非语义化值时跳过注入，
+      # 应用回退到 app_version.dart 的 defaultValue，不至于让构建失败。
+      - name: 构建 Flutter Windows（注入版本）
+        shell: pwsh
+        run: |
+          # 只取 x.y.z 主体：标签若带 +build / -rc 等后缀，--build-name 不接受，会直接构建失败
+          $num = ''
+          if ($env:APP_VERSION -match '^v?(\d+\.\d+\.\d+)(?:[+-].*)?$') { $num = $Matches[1] }
+          if ($num -eq '') {
+            Write-Host "APP_VERSION='$env:APP_VERSION' 非 x.y.z 语义化版本，跳过版本注入"
+          } else {
+            Write-Host "注入版本 $num"
+          }
+          $args = @('build', 'windows', '--release',
+                    "--dart-define=ECHOS_REPO=${{ github.repository }}")
+          if ($num -ne '') {
+            $args += "--dart-define=ECHOS_VERSION=$num"
+            $args += "--build-name=$num"
+          }
+          flutter @args
+
+      - name: 准备内核 x-tunnel.exe
+        shell: pwsh
+        run: |
+          $rel = 'build/windows/x64/runner/Release'
+          if (Test-Path 'third_party/x-tunnel/go.mod') {
+            # 从源码构建（仓库内可复现）
+            pushd 'third_party/x-tunnel'
+            go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o x-tunnel.exe .
+            popd
+            Copy-Item 'third_party/x-tunnel/x-tunnel.exe' "$rel/x-tunnel.exe" -Force
+          } elseif (Test-Path 'windows/bundle/x-tunnel.exe') {
+            # 直接使用仓库携带的二进制
+            Copy-Item 'windows/bundle/x-tunnel.exe' "$rel/x-tunnel.exe" -Force
+          } else {
+            Write-Error '未找到内核二进制或源码'
+            exit 1
+          }
+
+      - name: 下载 geo 数据（分流必需，打包时下载不入仓库）
+        shell: pwsh
+        run: |
+          $rel = 'build/windows/x64/runner/Release'
+          Invoke-WebRequest 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat' -OutFile "$rel/geoip.dat"
+          Invoke-WebRequest 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat' -OutFile "$rel/geosite.dat"
+
+      - name: 构建安装器（Inno Setup）-> EchOS-Win-<版本>-x64-Setup.exe
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/EchOS.iss "/DAPP_VERSION=$env:APP_VERSION"
+
+      - name: 构建便携单文件（7-Zip SFX 自解压）-> Output/EchOS-Win-<版本>-x64-Portable.exe
+        shell: pwsh
+        run: |
+          choco install 7zip -y --no-progress
+          $7z = 'C:\Program Files\7-Zip\7z.exe'
+          $ver = $env:APP_VERSION
+          $rel = Join-Path (Get-Location) 'build\windows\x64\runner\Release'
+          # 1) 在 Release 目录内压缩 → 归档条目平铺（echos.exe 在根，SFX 才能直接运行）
+          Push-Location $rel
+          & $7z a -t7z -y "$env:TEMP\portable.7z" * | Out-Null
+          Pop-Location
+          # 2) 下载支持 Installer 配置的 SFX 模块（官方 extra 自 7-Zip 20 起不再附带 7zSD.sfx）
+          Invoke-WebRequest 'https://raw.githubusercontent.com/OlegScherbakov/7zSFX/master/files/7zsd_extra_170_3900.7z' -OutFile "$env:TEMP\7zsd.7z"
+          & $7z x "$env:TEMP\7zsd.7z" -o"$env:TEMP\7zsd" -y | Out-Null
+          $sfx = "$env:TEMP\7zsd\7zsd_LZMA2_x64.sfx"
+          # 3) 统一用 LOGO 图标替换 SFX 模块图标（Resource Hacker 只替换资源，不改可执行功能）
+          #    只影响外观：拿不到工具就沿用 SFX 默认图标，不能让整个发布失败
+          $rh = $null
+          try {
+            Invoke-WebRequest 'https://www.angusj.com/resourcehacker/resource_hacker.zip' -OutFile "$env:TEMP\reshacker.zip"
+            & $7z x "$env:TEMP\reshacker.zip" -o"$env:TEMP\reshacker" -y | Out-Null
+            $rh = "$env:TEMP\reshacker\ResourceHacker.exe"
+          } catch {
+            Write-Output 'angusj.com 下载失败，回退到 choco 安装 ResourceHacker'
+          }
+          if (-not ($rh -and (Test-Path $rh))) {
+            choco install resourcehacker -y --no-progress
+            # choco 包主程序名可能是 ResourceHacker.exe 或 ResHacker.exe，按目录扫描更稳
+            $rh = @('C:\Program Files (x86)\Resource Hacker', 'C:\Program Files\Resource Hacker') |
+              Where-Object { Test-Path $_ } |
+              ForEach-Object { Get-ChildItem $_ -Filter '*.exe' -File -ErrorAction SilentlyContinue } |
+              Where-Object { $_.Name -match 'hacker' } |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if ($rh -and (Test-Path $rh)) {
+            & $rh -open $sfx -save $sfx -action addoverwrite -res "installer/logo.ico" -mask "ICONGROUP,MAINICON," | Out-Null
+            Write-Output "已替换 SFX 图标 -> $rh"
+          } else {
+            Write-Warning '未取得 ResourceHacker，便携版沿用 SFX 默认图标（不影响功能）'
+          }
+          # 4) 官方规范拼接：SFX 模块 + 配置 + 归档（运行时解压到临时目录→运行 echos.exe→退出后清理，Progress=no 无解压弹窗）
+          $out = Join-Path (Get-Location) "Output\EchOS-Win-$ver-x64-Portable.exe"
+          $parts = @($sfx, 'installer/portable-config.txt', "$env:TEMP\portable.7z")
+          $fs = [IO.File]::Create($out)
+          foreach ($p in $parts) {
+            $b = [IO.File]::ReadAllBytes($p)
+            $fs.Write($b, 0, $b.Length)
+          }
+          $fs.Close()
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: EchOS-Win-${{ env.APP_VERSION }}-x64
+          path: |
+            Output/EchOS-Win-${{ env.APP_VERSION }}-x64-Setup.exe
+            Output/EchOS-Win-${{ env.APP_VERSION }}-x64-Portable.exe
+            build/windows/x64/runner/Release/*
+          if-no-files-found: error
+          retention-days: 2   # 构建产物（安装包）仅保留 2 天
+
+      - name: 发布 GitHub Release（带更新日志 + 两个安装包）
+        # 推送 v* 标签 → 发布；手动触发 → 需勾选 publish_release。
+        # 用 github.event.inputs 而非 inputs：push 事件下 inputs 上下文不可用。
+        # 且必须显式 == 'true' —— event.inputs 取到的是字符串，'false' 同样为真值。
+        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event.inputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ver = $env:APP_VERSION
+          # 优先用仓库内随版本维护的更新说明 docs/releases/<tag>.md。
+          # 单提交基线下 --generate-notes 只会吐一个 Full Changelog 链接，信息量太低。
+          $notesFile = "docs/releases/$ver.md"
+          $args = @('release', 'create', $ver,
+                    "Output/EchOS-Win-$ver-x64-Setup.exe",
+                    "Output/EchOS-Win-$ver-x64-Portable.exe",
+                    '--title', "EchOS-Win $ver")
+          if (Test-Path $notesFile) {
+            Write-Output "使用更新说明：$notesFile"
+            $args += @('--notes-file', $notesFile)
+          } else {
+            Write-Output "未找到 $notesFile，回退为自动生成的提交列表"
+            $args += '--generate-notes'
+          }
+          gh @args
+
+      - name: 清理历史工作流记录（最多保留 2 条）
+        if: always()
+        # 清理只是锦上添花：权限变动或 API 抖动都不该把已成功的发布标记为失败
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          # GitHub 无原生「日志保留 N 条」；手动清理本工作流已完成（completed）的旧记录。
+          # 本次运行无法删除自己，因此保留「最新的 1 条已完成 + 本次」→ 本次完成后正好 ≤2 条。
+          $wfFile = ([IO.Path]::GetFileName('${{ github.workflow_ref }}'.Split('@')[0]))
+          $json = gh run list --workflow $wfFile --limit 50 --json databaseId,status --jq '[.[] | select(.status == "completed") | .databaseId]'
+          $ids = $json | ConvertFrom-Json
+          if ($ids.Count -gt 1) {
+            $drop = $ids[1..($ids.Count - 1)]
+          } else {
+            $drop = @()
+          }
+          foreach ($id in $drop) {
+            Write-Output "deleting finished run $id"
+            gh api -X DELETE "/repos/$env:GITHUB_REPOSITORY/actions/runs/$id" | Out-Null
+          }
+          Write-Output "done: 保留本次运行 + 最新完成 ($($ids.Count - $drop.Count)) 条"

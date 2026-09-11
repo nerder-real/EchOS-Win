@@ -1,0 +1,36 @@
+name: tray_manager
+description: This plugin allows Flutter desktop apps to defines system tray.
+version: 0.2.4
+publish_to: 'none'
+homepage: https://github.com/leanflutter/tray_manager
+
+platforms:
+  windows:
+
+topics:
+  - tray
+  - tray-manager
+  - system-tray
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.3.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  menu_base:
+    path: ../menu_base
+  path: ^1.8.0
+  shortid: ^0.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  mostly_reasonable_lints: ^0.1.2
+
+flutter:
+  plugin:
+    platforms:
+      windows:
+        pluginClass: TrayManagerPlugin

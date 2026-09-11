@@ -1,0 +1,4 @@
+name = "echos-worker"
+main = "Worker-ECH.js"
+# 必须 >= 2025-09-15，否则 cloudflare:sockets 的 connect() 出站数据不通（隧道 CONNECTED 后卡死）
+compatibility_date = "2025-09-15"
