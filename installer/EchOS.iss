@@ -51,7 +51,9 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall
+; 仅交互安装走完成页的复选框；静默安装由 [Code] 的 CurStepChanged 负责拉起，
+; 两者互斥，避免重复启动。
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall; Check: not WizardSilent()
 
 [Code]
 // —— 「正在运行的应用」页：二选一 ——
@@ -227,6 +229,11 @@ begin
     if WizardSilent then
       SaveStringToFile(GoMarkerPath, '1', False);
   end;
+  // 静默安装（自动更新路径）不显示完成页，带 postinstall 标志的 [Run] 条目
+  // 不会被执行 —— 表现就是「更新装完了，但新版本没人拉起来」。
+  // 这里补一次显式启动；交互安装仍由完成页复选框那条 [Run] 负责，二者互斥。
+  if (CurStep = ssPostInstall) and WizardSilent then
+    Exec(ExpandConstant('{app}\{#MyAppExeName}'), '', '', SW_SHOW, ewNoWait, rc);
 end;
 
 procedure DeinitializeSetup;
