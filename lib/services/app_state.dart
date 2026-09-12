@@ -1035,13 +1035,21 @@ if (\$path) { Write-Output ("{0}|{1}" -f \$ppid, \$path) }
           .last
           .replaceAll(RegExp(r'\.exe$', caseSensitive: false), '');
       // 纯 ASCII：不写中文注释，避免任何代码页问题。
+      // 末尾把执行结果追加到 %TEMP%\EchOS_UpdateWatch.log，便于事后确认
+      // 看门狗是否跑过、以及它判断要不要拉起。
       final script = r'''
 $ErrorActionPreference = 'SilentlyContinue'
+$log = Join-Path $env:TEMP 'EchOS_UpdateWatch.log'
 Wait-Process -Id __PID__ -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 8
-if (-not (Get-Process -Name '__NAME__' -ErrorAction SilentlyContinue)) {
+$p = Get-Process -Name '__NAME__' -ErrorAction SilentlyContinue
+$relaunched = 0
+if (-not $p) {
+  $relaunched = 1
   Start-Process -FilePath '__EXE__' -WorkingDirectory '__DIR__'
 }
+$line = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' setupPid=__PID__ alreadyRunning=' + $(if ($p) { 1 } else { 0 }) + ' relaunched=' + $relaunched
+Add-Content -Path $log -Value $line
 '''
           .replaceAll('__PID__', '$setupPid')
           .replaceAll('__NAME__', name)
