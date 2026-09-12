@@ -81,7 +81,3 @@ _portable_build.tmp
 
 # WorkBuddy AI 工作区状态
 .workbuddy-ai/
-
-# 本地构建中间产物（build_local.ps1 用，替代 %TEMP%）：
-# 便携版归档 echos_portable.7z(30MB)、7zSD SFX 模块、ResourceHacker。
-.build-tmp/

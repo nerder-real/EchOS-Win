@@ -6,6 +6,7 @@ import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'app_state.dart';
+import 'app_temp.dart';
 
 class TrayService with TrayListener {
   static final TrayService instance = TrayService._();
@@ -177,9 +178,7 @@ class TrayService with TrayListener {
 
   /// 把打包的托盘图标写为临时文件供托盘显示（蓝=已接管，橙=未接管）
   Future<void> _writeIcons() async {
-    final dir = Directory(
-        '${Directory.systemTemp.path}${Platform.pathSeparator}echos-tray');
-    dir.createSync(recursive: true);
+    final dir = appTempSubDir('echos-tray');
 
     final blue = File('${dir.path}${Platform.pathSeparator}tray-blue.ico');
     final blueData = await rootBundle.load('assets/tray-blue.ico');

@@ -14,6 +14,7 @@ import 'platform_drivers.dart';
 import 'port_tools.dart';
 import 'self_check.dart';
 import 'system_proxy.dart';
+import 'app_temp.dart';
 import 'app_version.dart';
 import 'updater.dart';
 
@@ -1042,7 +1043,7 @@ if (\$path) { Write-Output ("{0}|{1}" -f \$ppid, \$path) }
       // 看门狗是否跑过、以及它判断要不要拉起。
       final script = r'''
 $ErrorActionPreference = 'SilentlyContinue'
-$log = Join-Path $env:TEMP 'EchOS_UpdateWatch.log'
+$log = Join-Path '__TMP__' 'EchOS_UpdateWatch.log'
 Wait-Process -Id __PID__ -ErrorAction SilentlyContinue
 # 安装结束 -> 删除下载的安装包。Setup 刚退出时文件句柄可能还没完全释放，
 # 所以失败就等 1 秒重试，最多 10 次；真删不掉也只是留个文件，不影响使用。
@@ -1075,7 +1076,8 @@ Add-Content -Path $log -Value $line
           .replaceAll('__EXE__', exePath)
           .replaceAll('__DIR__', dir)
           // 单引号会提前闭合 PowerShell 字符串，转义成两个单引号
-          .replaceAll('__SETUP__', setupPath.replaceAll("'", "''"));
+          .replaceAll('__SETUP__', setupPath.replaceAll("'", "''"))
+          .replaceAll('__TMP__', appTempDirForScript().replaceAll("'", "''"));
       // 必须用 normal，不能用 detached：Dart 的 detached 以「无控制台」方式创建
       // 进程，脚本宿主起不来（实测 detached 与 detachedWithStdio 均不执行，
       // normal 正常）。注意这**只针对该脚本宿主**——cmd.exe 在三种模式下都能
@@ -1130,8 +1132,7 @@ Add-Content -Path $log -Value $line
     await File(newPath).copy(newFile);
 
     final selfPid = pid;
-    final batPath =
-        '${Directory.systemTemp.path}${Platform.pathSeparator}EchOS_Replace.bat';
+    final batPath = appTempFile('EchOS_Replace.bat');
     final bat = File(batPath);
     await bat.writeAsString('''@echo off
 setlocal

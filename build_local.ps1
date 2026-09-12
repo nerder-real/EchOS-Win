@@ -39,10 +39,11 @@ $root = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $rel  = Join-Path $root 'build\windows\x64\runner\Release'
 
-# 构建中间产物（便携版归档、SFX 模块、ResourceHacker）统一放项目下的 .build-tmp，
-# 不再用 %TEMP%：30MB 的归档不占系统盘；SFX / ResourceHacker 缓存跟着项目走，
-# 系统临时目录被清理也不用重新下载；要清干净直接删这个目录。已加 .gitignore。
-$tmp = Join-Path $root '.build-tmp'
+# 构建中间产物（便携版归档、SFX 模块、ResourceHacker）统一放 F:\WorkBuddy\Temp：
+# 不占 C 盘；目录在仓库之外，天然不会被 git 提交；SFX / ResourceHacker 缓存长期
+# 复用，系统临时目录被清理也不受影响。C:\Users\Zorro\go 与 %TEMP% 里的历史残留
+# 已清理，不要再往那两处写。
+$tmp = 'F:\WorkBuddy\Temp\go-build'
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 function Find-Exe {
@@ -128,6 +129,17 @@ if ($a -ne $b) { throw "产物内核与源码编译结果不一致（$a vs $b）
 Write-Host '  产物内核 md5 校验一致' -ForegroundColor Green
 
 # ---------- 3/4 安装包 ----------
+# 清空 Output，只保留本次构建的产物，避免历史版本越堆越多。
+# 刻意放在打包前而不是脚本开头：内核或 Flutter 阶段万一失败，
+# 上一次的产物还在，不会落得新旧两头空。
+$outDir = Join-Path $root 'Output'
+if (Test-Path $outDir) {
+    Get-ChildItem -LiteralPath $outDir -Force |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+}
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+Write-Host "  已清空 Output（只保留本次产物）" -ForegroundColor Gray
+
 Write-Host '=== 3/4 Inno Setup 安装包 ===' -ForegroundColor Cyan
 $iscc = Find-Exe @(
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
