@@ -4,8 +4,10 @@ version: 0.1.1
 homepage: https://github.com/leanflutter/menu_base
 
 environment:
-  sdk: ">=2.12.0 <3.0.0"
-  flutter: ">=1.12.0"
+  # 原为 ">=2.12.0 <3.0.0"（Dart 2 时代遗留）。跟随主工程统一到 Dart 3 /
+  # Flutter 3.47，避免 SDK 约束长期停留在已 EOL 的区间。
+  sdk: ^3.13.0
+  flutter: ">=3.47.0"
 
 dependencies:
   flutter:
@@ -14,6 +16,6 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^1.0.0
+  flutter_lints: ^6.0.0
 
 flutter:
