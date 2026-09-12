@@ -83,6 +83,14 @@ jobs:
           # 模块与构建产物（内核每次编译都要重新拉全部依赖）。
           cache-dependency-path: third_party/x-tunnel/go.sum
 
+      # 预期行为，别当故障排查：本工作流锁定 Flutter 3.47.4，其 Dart SDK 不满足仓库
+      # pubspec.lock 里 meta 1.18.0 / vector_math 2.2.0 的最低要求，因此这里会把它们
+      # 升到 1.19.0 / 2.4.2，日志表现为 "> meta 1.19.0 (was 1.18.0)" 和
+      # "Changed 2 dependencies!"。
+      # 这是 SDK 版本驱动的，**无法通过改 lock 消除**：本地 Flutter 3.44.9 的 Dart 3.12.2
+      # 装不上这两个新版本（pub upgrade 会报 incompatible with dependency constraints），
+      # 两边不可能共用一份 lock。
+      # 由于 flutter-version 已锁定，每次都由同一 SDK 解析 → 产物依然可复现。
       - run: flutter pub get
       # 更新源随仓库自动走（Fork 用 github.repository 指向自己的仓库）。
       # 版本号同步注入三处，缺一会导致自动更新静默失效（详见 app_version.dart 注释）：
