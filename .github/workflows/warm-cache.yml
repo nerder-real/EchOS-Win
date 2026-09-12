@@ -1,0 +1,71 @@
+name: Warm CI Cache
+
+# 为什么需要这个文件
+# ---------------------------------------------------------------------------
+# build-windows.yml 是靠推送 v* 标签触发的，而 GitHub Actions 的缓存**按 ref 隔离**：
+# 一个标签构建存下的缓存，下一个标签构建看不到。于是每次发版都要
+#   1) 重新下载并解压 1.79 GB 的 Flutter SDK（Setup Flutter 实测 80~138s）
+#   2) 结束时再上传一次 1.79 GB（Post Setup Flutter 17~29s）
+# 第 2 步传上去的缓存永远不会被用到 —— 纯浪费。
+# 日志里的铁证（key 完全相同却 Cache not found）：
+#   Cache not found for input keys: flutter-windows-stable-3.47.4-x64-9584c671…
+#   Cache saved with key:           flutter-windows-stable-3.47.4-x64-9584c671…
+#
+# 解决办法：在**默认分支 main** 上跑一遍「只装依赖、不打包」的任务，把 Flutter SDK、
+# pub 包、Go 模块与构建缓存写进 main 作用域。默认分支的缓存对所有分支和标签可见，
+# 之后 tag 构建就能命中。
+#
+# 触发时机：依赖或工作流文件变化时；另外每周跑一次，
+# 避免 GitHub 把超过 7 天未访问的缓存清理掉。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - pubspec.yaml
+      - pubspec.lock
+      - third_party/x-tunnel/go.mod
+      - third_party/x-tunnel/go.sum
+      - .github/workflows/build-windows.yml
+      - .github/workflows/warm-cache.yml
+  schedule:
+    # 每周一 03:00 UTC
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+jobs:
+  warm:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # 配置必须与 build-windows.yml **完全一致**（channel / cache / 版本来源），
+      # 否则生成的缓存 key 不同，预热等于白做。
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: 预热 pub 包缓存
+        run: flutter pub get
+
+      # 桌面端引擎产物也放进缓存，避免 tag 构建再下一次。
+      # 预热失败不影响发版流程，所以允许失败。
+      - name: 预热 Windows 桌面端引擎产物
+        continue-on-error: true
+        run: flutter config --enable-windows-desktop
+
+      - name: Setup Go (内核)
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: third_party/x-tunnel/go.mod
+          cache-dependency-path: third_party/x-tunnel/go.sum
+
+      # 预热模块缓存（GOMODCACHE）与构建缓存（GOCACHE），
+      # 这样 tag 构建编译内核时不必重新拉依赖、重新编译标准库。
+      - name: 预热 Go 模块与构建缓存
+        working-directory: third_party/x-tunnel
+        run: |
+          go mod download
+          go build ./...

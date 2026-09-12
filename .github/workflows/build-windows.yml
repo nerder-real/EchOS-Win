@@ -42,6 +42,10 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: third_party/x-tunnel/go.mod
+          # 不指定会报「Dependencies file is not found ... go.mod」并彻底禁用缓存：
+          # go.mod 在子目录，setup-go 默认只在仓库根找。指到 go.sum 才能缓存
+          # 模块与构建产物（内核每次编译都要重新拉全部依赖）。
+          cache-dependency-path: third_party/x-tunnel/go.sum
 
       - run: flutter pub get
       # 更新源随仓库自动走（Fork 用 github.repository 指向自己的仓库）。
@@ -98,14 +102,17 @@ jobs:
       - name: 构建安装器（Inno Setup）-> EchOS-Win-<版本>-x64-Setup.exe
         shell: pwsh
         run: |
-          choco install innosetup -y --no-progress
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/EchOS.iss "/DAPP_VERSION=$env:APP_VERSION"
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          # 镜像通常已自带：choco 即便命中「already installed」也要走一遍解析校验，
+          # 直接判断可执行文件是否存在更省事。
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc installer/EchOS.iss "/DAPP_VERSION=$env:APP_VERSION"
 
       - name: 构建便携单文件（7-Zip SFX 自解压）-> Output/EchOS-Win-<版本>-x64-Portable.exe
         shell: pwsh
         run: |
-          choco install 7zip -y --no-progress
           $7z = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $7z)) { choco install 7zip -y --no-progress }
           $ver = $env:APP_VERSION
           $rel = Join-Path (Get-Location) 'build\windows\x64\runner\Release'
           # 1) 在 Release 目录内压缩 → 归档条目平铺（echos.exe 在根，SFX 才能直接运行）
