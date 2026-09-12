@@ -158,6 +158,41 @@ jobs:
           }
           $fs.Close()
 
+      # 缓存只加速工具链，绝不能让产物变成「版本号看着是新的、内容还是旧的」。
+      # 把以前人工做的核对固化成一步：版本串必须真的进了 Dart 产物，
+      # 内核与分流数据必须在，两个包必须存在且大小正常。
+      - name: 打包产物自检（防伪更新）
+        shell: pwsh
+        run: |
+          $rel = 'build/windows/x64/runner/Release'
+          $num = ''
+          if ($env:APP_VERSION -match '^v?(\d+\.\d+\.\d+)$') { $num = $Matches[1] }
+
+          if ($num -ne '') {
+            # 版本串没进产物 → 客户端自报版本不对 → 自动更新静默失效
+            $so = "$rel/data/app.so"
+            if (-not (Test-Path $so)) { Write-Error "缺少 $so"; exit 1 }
+            $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($so))
+            $hit = ([regex]::Matches($text, [regex]::Escape($num))).Count
+            Write-Output "app.so 中版本串 $num 出现 $hit 次"
+            if ($hit -eq 0) { Write-Error "产物内没有版本串 $num —— 版本未注入"; exit 1 }
+          } else {
+            Write-Output "APP_VERSION='$env:APP_VERSION' 非语义化版本，跳过版本串校验"
+          }
+
+          foreach ($f in @("$rel/echos.exe", "$rel/x-tunnel.exe", "$rel/geoip.dat", "$rel/geosite.dat")) {
+            if (-not (Test-Path $f)) { Write-Error "缺少 $f"; exit 1 }
+          }
+
+          foreach ($f in @("Output/EchOS-Win-$env:APP_VERSION-x64-Setup.exe",
+                           "Output/EchOS-Win-$env:APP_VERSION-x64-Portable.exe")) {
+            if (-not (Test-Path $f)) { Write-Error "缺少 $f"; exit 1 }
+            $len = (Get-Item $f).Length
+            if ($len -lt 1MB) { Write-Error "$f 仅 $len 字节，明显异常"; exit 1 }
+            Write-Output ("{0}  {1:N1} MB" -f $f, ($len / 1MB))
+          }
+          Write-Output '产物自检通过'
+
       - uses: actions/upload-artifact@v6
         with:
           name: EchOS-Win-${{ env.APP_VERSION }}-x64
