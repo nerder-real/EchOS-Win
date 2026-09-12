@@ -39,6 +39,12 @@ $root = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $rel  = Join-Path $root 'build\windows\x64\runner\Release'
 
+# 构建中间产物（便携版归档、SFX 模块、ResourceHacker）统一放项目下的 .build-tmp，
+# 不再用 %TEMP%：30MB 的归档不占系统盘；SFX / ResourceHacker 缓存跟着项目走，
+# 系统临时目录被清理也不用重新下载；要清干净直接删这个目录。已加 .gitignore。
+$tmp = Join-Path $root '.build-tmp'
+New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+
 function Find-Exe {
     param([string[]]$Candidates, [string]$Name)
     foreach ($c in $Candidates) {
@@ -150,25 +156,25 @@ $7z = Find-Exe @(
 if (-not $7z) { throw '未找到 7z.exe，请先安装 7-Zip' }
 
 # 4.1 在 Release 目录内压缩，归档条目平铺（echos.exe 在根，SFX 才能直接运行）
-$arc = Join-Path $env:TEMP 'echos_portable.7z'
+$arc = Join-Path $tmp 'echos_portable.7z'
 Push-Location $rel
 & $7z a -t7z -y "$arc" * | Out-Null
 Invoke-Checked '7z 压缩'
 Pop-Location
 
 # 4.2 SFX 模块（需支持 ;!@Install@! 配置，故用 7zSD 而非 7-Zip 自带的 7z.sfx）
-$sfx = Join-Path $env:TEMP 'iconed.sfx'
+$sfx = Join-Path $tmp 'iconed.sfx'
 if (-not (Test-Path $sfx)) {
-    $sfxSrc = Join-Path $env:TEMP '7zsd_x\7zsd_LZMA2_x64.sfx'
+    $sfxSrc = Join-Path $tmp '7zsd_x\7zsd_LZMA2_x64.sfx'
     if (-not (Test-Path $sfxSrc)) {
         Write-Host '  下载 7zSD SFX 模块...' -ForegroundColor Gray
-        $dl = Join-Path $env:TEMP '7zsd.7z'
+        $dl = Join-Path $tmp '7zsd.7z'
         Invoke-WebRequest 'https://raw.githubusercontent.com/OlegScherbakov/7zSFX/master/files/7zsd_extra_170_3900.7z' -OutFile $dl
-        & $7z x "$dl" "-o$(Join-Path $env:TEMP '7zsd_x')" -y | Out-Null
+        & $7z x "$dl" "-o$(Join-Path $tmp '7zsd_x')" -y | Out-Null
     }
     Copy-Item $sfxSrc $sfx -Force
     # 4.3 用 LOGO 替换 SFX 图标（ResourceHacker 只换资源，不改可执行功能）
-    $rh = Join-Path $env:TEMP 'reshacker\ResourceHacker.exe'
+    $rh = Join-Path $tmp 'reshacker\ResourceHacker.exe'
     if (Test-Path $rh) {
         & $rh -open "$sfx" -save "$sfx" -action addoverwrite `
               -res (Join-Path $root 'installer\logo.ico') -mask 'ICONGROUP,MAINICON,' | Out-Null
