@@ -93,6 +93,13 @@ class KernelManager {
   static final KernelManager instance = KernelManager._();
   KernelManager._();
 
+  // kernel.log 的上限，超过就轮转成 kernel.prev.log（只留一份）。
+  // 这个文件的写入量远大于其他日志：内核 stdout/stderr 每一行都落盘，且不受
+  // 「日志级别」设置控制（级别只能关掉界面日志）。实测播放视频时约 480 KB/h，
+  // 1MB 撑不到 3 小时就轮转一次，排障时历史早被冲掉了。4MB 可覆盖高峰约 8 小时、
+  // 日常使用约一天，加上 prev 一份共约 8MB，单文件用记事本打开也不卡。
+  static const int kernelLogMaxBytes = 4 * 1024 * 1024; // 4MB
+
   Process? _process;
   bool _processAlive = false;
   bool isRunning = false;
@@ -358,15 +365,15 @@ class KernelManager {
     if (_lastLines.length > 30) _lastLines.removeAt(0);
   }
 
-  /// 把内核日志落盘到 logs/kernel.log（>1MB 轮转到 kernel.prev.log），
-  /// 便于事后诊断隧道/通道问题。
+  /// 把内核日志落盘到 logs/kernel.log（超过 kernelLogMaxBytes 轮转到
+  /// kernel.prev.log），便于事后诊断隧道/通道问题。
   void _persist(String l) {
     try {
       final dir = Directory(
           '${AppPaths.appDataDir.path}${Platform.pathSeparator}logs');
       dir.createSync(recursive: true);
       final f = File('${dir.path}${Platform.pathSeparator}kernel.log');
-      if (f.existsSync() && f.lengthSync() > (1 << 20)) {
+      if (f.existsSync() && f.lengthSync() > kernelLogMaxBytes) {
         final prev = File('${dir.path}${Platform.pathSeparator}kernel.prev.log');
         if (prev.existsSync()) prev.deleteSync();
         f.renameSync(prev.path);
