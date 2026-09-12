@@ -15,8 +15,9 @@ name: Warm CI Cache
 # pub 包、Go 模块与构建缓存写进 main 作用域。默认分支的缓存对所有分支和标签可见，
 # 之后 tag 构建就能命中。
 #
-# 触发时机：依赖或工作流文件变化时；另外每周跑一次，
-# 避免 GitHub 把超过 7 天未访问的缓存清理掉。
+# 触发时机：依赖或工作流文件变化时；另外每天跑一次保活 ——
+# GitHub 会清理超过 7 天未被访问的缓存，一周一次间隔太长，
+# 万一发版正好落在清理前后就会掉回冷启动。
 
 on:
   push:
@@ -45,6 +46,10 @@ concurrency:
 jobs:
   warm:
     runs-on: windows-latest
+    permissions:
+      # 删缓存走 gh api，没有 actions:write 会 403。而该步骤带 continue-on-error，
+      # 失败只是静默跳过 —— 看起来像「没有需要清理的缓存」，实际一条都没删。
+      actions: write
     steps:
       - uses: actions/checkout@v5
 
@@ -58,16 +63,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          $ids = gh api "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100" --jq '.actions_caches[] | select(.ref != "refs/heads/main") | .id'
-          if (-not $ids) { Write-Output '没有需要清理的缓存'; exit 0 }
-          $n = 0
-          foreach ($id in ($ids -split "`n")) {
-            $id = $id.Trim()
-            if ($id -eq '') { continue }
-            gh api -X DELETE "/repos/$env:GITHUB_REPOSITORY/actions/caches/$id" | Out-Null
-            $n++
+          $resp = gh api "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100" 2>&1
+          # 别静默：以前用 --jq 直接取 id，403 时管道拿到空串，
+          # 于是走进「没有需要清理的缓存」分支，一条没删还以为清理成功了。
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "列出缓存失败（多半是缺少 actions:write 权限）：$resp"
+            exit 0
           }
-          Write-Output "已清理 $n 条非 main 作用域缓存"
+          $all = ($resp | ConvertFrom-Json).actions_caches
+          Write-Output ("清理前：{0} 条 / {1:N2} GB" -f $all.Count, (($all | Measure-Object -Property size_in_bytes -Sum).Sum / 1GB))
+          $dead = @($all | Where-Object { $_.ref -ne 'refs/heads/main' })
+          if ($dead.Count -eq 0) { Write-Output '没有需要清理的缓存'; exit 0 }
+          $n = 0; $freed = 0
+          foreach ($c in $dead) {
+            Write-Output "  - 删除 [$($c.ref)] $($c.key)  $([math]::Round($c.size_in_bytes / 1GB, 2)) GB"
+            gh api -X DELETE "/repos/$env:GITHUB_REPOSITORY/actions/caches/$($c.id)" | Out-Null
+            if ($LASTEXITCODE -eq 0) { $n++; $freed += $c.size_in_bytes }
+          }
+          Write-Output ("已清理 {0}/{1} 条非 main 作用域缓存，回收 {2:N2} GB" -f $n, $dead.Count, ($freed / 1GB))
 
       # 配置必须与 build-windows.yml **完全一致**（channel / cache / 版本来源），
       # 否则生成的缓存 key 不同，预热等于白做。
@@ -75,6 +88,10 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          # 必须与 build-windows.yml 的 flutter-version **一字不差**：
+          # 版本号是缓存 key 的一部分，两边不一致就各存各的，预热白做。
+          # 升级 Flutter 时记得同时改这两个文件。
+          flutter-version: '3.47.4'
           cache: true
 
       - name: 预热 pub 包缓存
@@ -99,3 +116,27 @@ jobs:
         run: |
           go mod download
           go build ./...
+
+      # 本工作流只是「顺手清自己」，所以删除失败不该让预热变红；
+      # 但也不能像以前那样静默——403 时得在日志里看得见。
+      - name: 清理历史工作流记录（最多保留 2 条）
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $resp = gh run list --workflow ([IO.Path]::GetFileName('${{ github.workflow_ref }}'.Split('@')[0])) --limit 50 --json databaseId,status 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "列出运行记录失败（多半是缺少 actions:write 权限）：$resp"
+            exit 0
+          }
+          # status=completed 表示「已结束」（含成功/失败/取消）；本次运行不在其中，CI 无法删自己。
+          $ids = @(($resp | ConvertFrom-Json) | Where-Object { $_.status -eq 'completed' } | Select-Object -ExpandProperty databaseId)
+          if ($ids.Count -gt 1) { $drop = $ids[1..($ids.Count - 1)] } else { $drop = @() }
+          foreach ($id in $drop) {
+            Write-Output "deleting finished run $id"
+            gh api -X DELETE "/repos/$env:GITHUB_REPOSITORY/actions/runs/$id" | Out-Null
+          }
+          Write-Output "done: 保留本次运行 + 最新完成 $($ids.Count - $drop.Count) 条"
+          exit 0

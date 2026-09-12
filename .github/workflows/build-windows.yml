@@ -43,21 +43,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          $ids = gh api "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100" --jq '.actions_caches[] | select(.ref != "refs/heads/main") | .id'
-          if (-not $ids) { Write-Output '没有需要清理的缓存'; exit 0 }
-          $n = 0
-          foreach ($id in ($ids -split "`n")) {
-            $id = $id.Trim()
-            if ($id -eq '') { continue }
-            gh api -X DELETE "/repos/$env:GITHUB_REPOSITORY/actions/caches/$id" | Out-Null
-            $n++
+          $resp = gh api "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100" 2>&1
+          # 别静默：403 时 --jq 管道只会拿到空串，会误报「没有需要清理的缓存」
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "列出缓存失败（多半是缺少 actions:write 权限）：$resp"
+            exit 0
           }
-          Write-Output "已清理 $n 条非 main 作用域缓存"
+          $all = ($resp | ConvertFrom-Json).actions_caches
+          Write-Output ("清理前：{0} 条 / {1:N2} GB" -f $all.Count, (($all | Measure-Object -Property size_in_bytes -Sum).Sum / 1GB))
+          $dead = @($all | Where-Object { $_.ref -ne 'refs/heads/main' })
+          if ($dead.Count -eq 0) { Write-Output '没有需要清理的缓存'; exit 0 }
+          $n = 0; $freed = 0
+          foreach ($c in $dead) {
+            Write-Output "  - 删除 [$($c.ref)] $($c.key)  $([math]::Round($c.size_in_bytes / 1GB, 2)) GB"
+            gh api -X DELETE "/repos/$env:GITHUB_REPOSITORY/actions/caches/$($c.id)" | Out-Null
+            if ($LASTEXITCODE -eq 0) { $n++; $freed += $c.size_in_bytes }
+          }
+          Write-Output ("已清理 {0}/{1} 条非 main 作用域缓存，回收 {2:N2} GB" -f $n, $dead.Count, ($freed / 1GB))
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          # 锁死版本，别跟着 stable 漂：
+          #   1) 缓存 key 里含版本号（flutter-windows-stable-<版本>-x64-…），
+          #      stable 一升级 key 就变，main 上预热的缓存立刻失配，又退回冷启动；
+          #   2) 同一版本的 SDK 才能解析出同一套依赖，发版产物才可复现。
+          # 升级时**两处一起改**（本文件 + warm-cache.yml），否则 key 不同，预热白做。
+          flutter-version: '3.47.4'
           cache: true
 
       - name: Setup Go (内核)
