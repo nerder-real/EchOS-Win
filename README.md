@@ -111,10 +111,9 @@ cd worker && ./deploy-worker.sh   # 需 wrangler + Cloudflare 登录
 
 ## 开源说明
 
-- 本项目基于 MIT 协议开源，详见 [LICENSE](LICENSE)
-- **仅供学习交流使用，请勿用于商业用途；请在下载后 24 小时内删除。**
+- 本项目基于 MIT 协议开源，详见 [LICENSE](LICENSE)。MIT 允许自由使用、修改与分发，**包含商业用途**，仅要求保留版权与许可声明
 - 请遵守所在地区的法律法规；ECH 是加密传输技术，本身无好坏之分，请勿用于任何非法用途
-- `assets/geoip.dat`、`assets/geosite.dat` 为分流规则数据，遵循各自上游开源协议
+- 分流规则数据 `geoip.dat`、`geosite.dat` 在构建时从上游下载（不随仓库分发），遵循各自上游开源协议
 - 本项目不提供任何可用的公共代理服务器，服务端需自行部署（见上文 Cloudflare 部署）
 
 ---
