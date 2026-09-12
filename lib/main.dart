@@ -39,7 +39,13 @@ class _KeepCentered with WindowListener {
 const int _ipcPort = 45871;
 
 /// 已有实例在跑时：让它把主窗口带到前台，本进程随后退出。
-/// 返回 true 表示「本实例应退出」（无论唤起成功与否，维持单实例语义）。
+/// 返回 true 表示「本实例应退出」。
+///
+/// 判据必须是「锁里的 PID 确实属于本程序」，不能只看 PID 存活着：
+/// **PID 会被系统复用**。旧实现只调 tasklist 按 PID 过滤，锁里残留的旧 PID
+/// 一旦被别的进程占用（实测撞上 msedge.exe），就会被误判成「已有实例在跑」，
+/// 于是唤起失败也照样退出 —— 表现为「双击图标完全没反应，应用起不来」，
+/// 且会一直持续到 PID 再次变化。现在核对映像名，不匹配就接管锁。
 Future<bool> _wakeExistingInstance() async {
   try {
     final dir = Directory(AppPaths.appDataDir.path)
@@ -47,11 +53,13 @@ Future<bool> _wakeExistingInstance() async {
     final lock = File('${dir.path}${Platform.pathSeparator}instance.lock');
     if (lock.existsSync()) {
       final ownerPid = int.tryParse(lock.readAsStringSync().trim());
-      if (ownerPid != null && _pidAlive(ownerPid)) {
+      // ownerPid == pid 只在极端复用下出现，一并排除避免自己把自己挡住。
+      if (ownerPid != null && ownerPid != pid && _isOwnProcess(ownerPid)) {
         await _tryWake();
         return true;
       }
     }
+    // 无锁 / 解析失败 / 该 PID 不是本程序 → 视为陈旧锁，接管
     lock.writeAsStringSync('$pid');
   } catch (_) {
     // 锁文件异常不影响启动
@@ -93,10 +101,20 @@ Future<void> _listenForWake() async {
   }
 }
 
-bool _pidAlive(int pid) {
+/// 判断 pid 对应的进程是不是本程序的可执行文件。
+///
+/// tasklist 的 `/fi "PID eq N"` 只按 PID 过滤，不告诉你是哪个程序；
+/// 必须再用 `/fo csv` 取映像名比对，否则 PID 复用会让陈旧锁把应用锁死。
+bool _isOwnProcess(int p) {
   try {
-    final r = Process.runSync('tasklist', ['/fi', 'PID eq $pid']);
-    return r.stdout.toString().contains('$pid');
+    final selfName = Platform.resolvedExecutable
+        .split(Platform.pathSeparator)
+        .last
+        .toLowerCase();
+    if (selfName.isEmpty) return false;
+    final r = Process.runSync(
+        'tasklist', ['/fi', 'PID eq $p', '/fo', 'csv', '/nh']);
+    return r.stdout.toString().toLowerCase().contains(selfName);
   } catch (_) {
     return false;
   }
