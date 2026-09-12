@@ -990,8 +990,24 @@ if (\$path) { Write-Output ("{0}|{1}" -f \$ppid, \$path) }
   }
 
   /// 安装版：静默运行 Setup.exe 就地覆盖，配置在 APPDATA 不受影响。
+  ///
+  /// 注意：**绝不能手写引号**。Dart 在 Windows 上会把参数列表拼成命令行
+  /// 并为含空格的参数自动加引号；若参数里已经写了 `"`，Dart 会再转义成 `\"`，
+  /// 子进程收到 `/DIR=\"D:\Program Files\EchOS\"`，Inno 认为 `"` 是非法字符
+  /// 直接中止安装（表现为「更新了但没装上」，日志里是「文件夹名称不能包含下列
+  /// 任何字符」+ aborting）。
+  ///
+  /// 另外起一个看门狗批处理：等 Setup 退出后若 echos.exe 没起来就重新拉起。
+  /// 这样即使安装失败（权限/文件占用等），旧版也能回来并再次提示更新，
+  /// 不会留下「应用没了、也没任何提示」的死局。
   Future<void> _runSetupSilently(String setupPath, String exePath) async {
-    var args = [
+    var dir = File(exePath).parent.path;
+    // 结尾反斜杠会和 Dart 补上的引号粘成 `\"`，同样触发 Inno 的非法字符校验。
+    while (dir.endsWith(Platform.pathSeparator) && dir.length > 3) {
+      dir = dir.substring(0, dir.length - 1);
+    }
+    final args = [
+      '/DIR=$dir', // 不要加引号，Dart 会处理
       '/VERYSILENT',
       '/SUPPRESSMSGBOXES',
       '/NORESTART',
@@ -999,9 +1015,41 @@ if (\$path) { Write-Output ("{0}|{1}" -f \$ppid, \$path) }
       '/NOCANCEL',
       '/MERGETASKS=!desktopicon',
     ];
-    args = ['/DIR="${File(exePath).parent.path}"', ...args];
-    await Process.start(setupPath, args,
+    final proc = await Process.start(setupPath, args,
         mode: ProcessStartMode.detachedWithStdio);
+    await _spawnUpdateWatchdog(proc.pid, exePath);
+  }
+
+  /// 更新看门狗：等 Setup 进程退出 → 等新进程起来 → 没起来就重新拉起 exePath。
+  Future<void> _spawnUpdateWatchdog(int setupPid, String exePath) async {
+    try {
+      final batPath =
+          '${Directory.systemTemp.path}${Platform.pathSeparator}EchOS_UpdateWatch.bat';
+      final bat = File(batPath);
+      await bat.writeAsString('''@echo off
+setlocal
+set "SETUP_PID=$setupPid"
+set "APP=$exePath"
+for %%F in ("%APP%") do set "NAME=%%~nxF"
+for %%F in ("%APP%") do set "DIR=%%~dpF"
+:waitSetup
+ping 127.0.0.1 -n 3 >nul
+tasklist /FI "PID eq %SETUP_PID%" 2>nul | findstr "%SETUP_PID%" >nul
+if not errorlevel 1 goto waitSetup
+rem 给 Setup 自身拉起新进程留足时间
+ping 127.0.0.1 -n 8 >nul
+tasklist /FI "IMAGENAME eq %NAME%" 2>nul | findstr /I "%NAME%" >nul
+if not errorlevel 1 goto done
+rem 必须带 /D：批处理在 %TEMP% 下运行，缺省工作目录会让内核/资源走相对路径
+start "" /D "%DIR%" "%APP%"
+:done
+del "%~f0"
+''', flush: true);
+      await Process.start('cmd.exe', ['/c', 'start', '/min', batPath],
+          mode: ProcessStartMode.detached);
+    } catch (_) {
+      // 看门狗失败不影响安装本身
+    }
   }
 
   /// 便携版就地替换：把新版写给用户真正的 Portable.exe。

@@ -232,8 +232,12 @@ begin
   // 静默安装（自动更新路径）不显示完成页，带 postinstall 标志的 [Run] 条目
   // 不会被执行 —— 表现就是「更新装完了，但新版本没人拉起来」。
   // 这里补一次显式启动；交互安装仍由完成页复选框那条 [Run] 负责，二者互斥。
-  if (CurStep = ssPostInstall) and WizardSilent then
+  if (CurStep = ssPostInstall) and WizardSilent then begin
+    // 先切到 {app}：安装程序进程的工作目录未必是安装目录，子进程按相对路径
+    // 找内核/资源会失败。
+    SetCurrentDir(ExpandConstant('{app}'));
     Exec(ExpandConstant('{app}\{#MyAppExeName}'), '', '', SW_SHOW, ewNoWait, rc);
+  end;
 end;
 
 procedure DeinitializeSetup;
