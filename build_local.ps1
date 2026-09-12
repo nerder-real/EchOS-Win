@@ -61,17 +61,27 @@ Write-Host ''
 # 直接输出到 windows/bundle/，保证 flutter build 拷的是刚编好的这一份。
 # go / flutter 不一定在当前 shell 的 PATH 里（比如从 Git Bash 或某些终端启动），
 # 这里显式按常见安装位置兜底查找，找不到再报错，避免中途莫名中断。
+# Go 已统一到 C:\Go（GOROOT），兼容旧的 ~/sdk/go 布局
 $go = Find-Exe @(
-    "$env:USERPROFILE\sdk\go\bin\go.exe",
+    'C:\Go\bin\go.exe',
     "$env:ProgramFiles\Go\bin\go.exe",
-    'C:\go\bin\go.exe'
+    "$env:USERPROFILE\sdk\go\bin\go.exe"
 ) 'go'
 if (-not $go) { throw '未找到 go.exe，请安装 Go 或把 go 加入 PATH' }
+# 预检：只判断「文件存在」不够。某些受限环境（沙箱/策略）会让 go.exe 启动即失败，
+# 表现为无任何输出且 $LASTEXITCODE 保持为空 —— 到下面 Invoke-Checked 就只剩
+# 「失败（exit=）」这种没有信息量的提示。这里先跑一次 go version 把问题说清楚。
+$goProbe = & $go version 2>&1
+if (-not $goProbe) {
+    throw "go.exe 存在但无法执行（$go）。常见原因：当前终端被沙箱/安全策略限制了子进程启动。`n请在普通 PowerShell / 终端中重跑本脚本。"
+}
+Write-Host "  go: $goProbe" -ForegroundColor Gray
 
+# Flutter 已统一到 C:\Flutter
 $flutter = Find-Exe @(
-    "$env:USERPROFILE\flutter\bin\flutter.bat",
-    'C:\flutter\bin\flutter.bat',
-    'C:\src\flutter\bin\flutter.bat'
+    'C:\Flutter\bin\flutter.bat',
+    'C:\src\flutter\bin\flutter.bat',
+    "$env:USERPROFILE\flutter\bin\flutter.bat"
 ) 'flutter'
 if (-not $flutter) { throw '未找到 flutter.bat，请安装 Flutter 或把 flutter 加入 PATH' }
 
