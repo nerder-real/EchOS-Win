@@ -1021,32 +1021,48 @@ if (\$path) { Write-Output ("{0}|{1}" -f \$ppid, \$path) }
   }
 
   /// 更新看门狗：等 Setup 进程退出 → 等新进程起来 → 没起来就重新拉起 exePath。
+  ///
+  /// 用 PowerShell 而不是批处理。批处理在这里有两个躲不开的坑：
+  ///   1) `%%~dpF` 取到的目录**带结尾反斜杠**，`start "" /D "%DIR%" "%APP%"` 里
+  ///      的 `\"` 会转义掉闭合引号，整行被拆坏（实测报 `'hos.exe"'`、`'o'` 等）；
+  ///   2) 写出去的文件是 UTF-8，cmd 按 GBK 解析，中文注释变乱码甚至产生杂字符。
+  /// 改成 PowerShell + 参数列表后，引号一律由 Dart 负责，两条都规避掉了。
   Future<void> _spawnUpdateWatchdog(int setupPid, String exePath) async {
     try {
-      final batPath =
-          '${Directory.systemTemp.path}${Platform.pathSeparator}EchOS_UpdateWatch.bat';
-      final bat = File(batPath);
-      await bat.writeAsString('''@echo off
-setlocal
-set "SETUP_PID=$setupPid"
-set "APP=$exePath"
-for %%F in ("%APP%") do set "NAME=%%~nxF"
-for %%F in ("%APP%") do set "DIR=%%~dpF"
-:waitSetup
-ping 127.0.0.1 -n 3 >nul
-tasklist /FI "PID eq %SETUP_PID%" 2>nul | findstr "%SETUP_PID%" >nul
-if not errorlevel 1 goto waitSetup
-rem 给 Setup 自身拉起新进程留足时间
-ping 127.0.0.1 -n 8 >nul
-tasklist /FI "IMAGENAME eq %NAME%" 2>nul | findstr /I "%NAME%" >nul
-if not errorlevel 1 goto done
-rem 必须带 /D：批处理在 %TEMP% 下运行，缺省工作目录会让内核/资源走相对路径
-start "" /D "%DIR%" "%APP%"
-:done
-del "%~f0"
-''', flush: true);
-      await Process.start('cmd.exe', ['/c', 'start', '/min', batPath],
-          mode: ProcessStartMode.detached);
+      final dir = File(exePath).parent.path;
+      final name = exePath
+          .split(Platform.pathSeparator)
+          .last
+          .replaceAll(RegExp(r'\.exe$', caseSensitive: false), '');
+      // 纯 ASCII：不写中文注释，避免任何代码页问题。
+      final script = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+Wait-Process -Id __PID__ -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 8
+if (-not (Get-Process -Name '__NAME__' -ErrorAction SilentlyContinue)) {
+  Start-Process -FilePath '__EXE__' -WorkingDirectory '__DIR__'
+}
+'''
+          .replaceAll('__PID__', '$setupPid')
+          .replaceAll('__NAME__', name)
+          .replaceAll('__EXE__', exePath)
+          .replaceAll('__DIR__', dir);
+      // 必须用 normal，不能用 detached：powershell 是控制台程序，Dart 的 detached
+      // 以「无控制台」方式创建进程，powershell 起不来（实测 detached 与
+      // detachedWithStdio 均不执行，normal 正常）。Windows 上子进程独立于父进程，
+      // 主进程 exit(0) 后子进程照常跑完 —— 已实测确认。
+      await Process.start(
+        'powershell',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-WindowStyle',
+          'Hidden',
+          '-Command',
+          script,
+        ],
+        mode: ProcessStartMode.normal,
+      );
     } catch (_) {
       // 看门狗失败不影响安装本身
     }
