@@ -31,6 +31,29 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # 每次 tag 构建都会在**自己**的作用域里存一份 1.84 GB 的 Flutter SDK 副本，
+      # 而 Actions 缓存按 ref 隔离，这份副本永远不会被别的 ref 读到。
+      # 几个版本下来实测占满 11.12 GB（超过单仓库 10 GB 上限），
+      # 于是 GitHub 按 LRU 回收，连 main 分支的预热缓存都被清掉 —— 每次都冷启动。
+      # 这里在开头清掉非 main 作用域的缓存，把占用压回 ~3.7 GB。
+      # 必须放开头：缓存是在所有步骤之后的 post 阶段才保存的，放结尾会被覆盖回来。
+      - name: 清理 tag 作用域缓存（防占满 10 GB 配额）
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ids = gh api "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100" --jq '.actions_caches[] | select(.ref != "refs/heads/main") | .id'
+          if (-not $ids) { Write-Output '没有需要清理的缓存'; exit 0 }
+          $n = 0
+          foreach ($id in ($ids -split "`n")) {
+            $id = $id.Trim()
+            if ($id -eq '') { continue }
+            gh api -X DELETE "/repos/$env:GITHUB_REPOSITORY/actions/caches/$id" | Out-Null
+            $n++
+          }
+          Write-Output "已清理 $n 条非 main 作用域缓存"
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:

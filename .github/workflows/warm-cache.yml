@@ -29,15 +29,45 @@ on:
       - .github/workflows/build-windows.yml
       - .github/workflows/warm-cache.yml
   schedule:
-    # 每周一 03:00 UTC
-    - cron: '0 3 * * 1'
+    # 每天 03:00 UTC。不只是为了「预热」，更是为了保活：
+    # GitHub 会清理超过 7 天未被访问的缓存，一周一次间隔太长，
+    # 万一发版正好落在清理前后就会掉回冷启动。本仓库是 Public（分钟数不限），
+    # 每天一次的开销可以接受。
+    - cron: '0 3 * * *'
   workflow_dispatch:
+
+# 防止两次预热重叠：同时保存同一个 key 会有一方失败（缓存已存在），
+# 虽然无害但会留下误导性的报错。排队即可，后到的直接取消。
+concurrency:
+  group: warm-cache
+  cancel-in-progress: true
 
 jobs:
   warm:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+
+      # 清掉 tag 构建留下的死缓存：它们存在各自的 tag 作用域里，
+      # 永远读不到，却会占满 10 GB 配额并挤掉 main 作用域的预热缓存。
+      # 想立刻回收空间，直接在 Actions 页面手动 Run workflow 即可。
+      # 放在开头：缓存是在所有步骤之后的 post 阶段保存的。
+      - name: 清理 tag 作用域缓存
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ids = gh api "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100" --jq '.actions_caches[] | select(.ref != "refs/heads/main") | .id'
+          if (-not $ids) { Write-Output '没有需要清理的缓存'; exit 0 }
+          $n = 0
+          foreach ($id in ($ids -split "`n")) {
+            $id = $id.Trim()
+            if ($id -eq '') { continue }
+            gh api -X DELETE "/repos/$env:GITHUB_REPOSITORY/actions/caches/$id" | Out-Null
+            $n++
+          }
+          Write-Output "已清理 $n 条非 main 作用域缓存"
 
       # 配置必须与 build-windows.yml **完全一致**（channel / cache / 版本来源），
       # 否则生成的缓存 key 不同，预热等于白做。
