@@ -32,13 +32,13 @@ dependencies:
     sdk: flutter
 
 # The following adds the Cupertino Icons font to your application.
-  window_manager: ^0.4.3
+  window_manager: ^0.5.2
   tray_manager:
     path: third_party/tray_manager
   # vendored via third_party（给 MenuItem 增加 accent 字段，配合托盘自绘配色）
   menu_base:
     path: third_party/menu_base
-  file_picker: ^11.0.3
+  file_picker: ^12.3.0
   screen_retriever: ^0.2.2
   ffi: ^2.1.3
 

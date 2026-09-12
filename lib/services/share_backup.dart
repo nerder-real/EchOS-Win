@@ -178,20 +178,18 @@ class WebDAVClient {
 class ShareBackup {
   static AppState get _app => AppState.instance;
 
-  /// 导出已保存的服务器（写到用户选择的路径）
-  static Future<String?> exportServers(List<String> ids, String path) async {
+  /// 生成服务器分享文件的 JSON 文本。
+  /// file_picker 12 起落盘由文件对话框负责（saveFile 必须传入内容本身），
+  /// 所以这里只做序列化，返回 json 文本与实际导出的条数。
+  static ({String json, int count}) buildServersJson(List<String> ids) {
     final saved = _app.config.servers
         .where((s) => ids.contains(s.id) && _app.isServerSaved(s.id))
         .toList();
-    try {
-      final enc = const JsonEncoder.withIndent('  ');
-      File(path).writeAsStringSync(enc.convert(ServerShareFile(saved).toJson()),
-          flush: true);
-      _app.log('已导出 ${saved.length} 个服务器');
-      return null;
-    } catch (e) {
-      return '未能写入分享文件：$e';
-    }
+    final enc = const JsonEncoder.withIndent('  ');
+    return (
+      json: enc.convert(ServerShareFile(saved).toJson()),
+      count: saved.length,
+    );
   }
 
   /// 导入服务器（对齐 Mac importServers 逻辑）
@@ -256,18 +254,9 @@ class ShareBackup {
     }
   }
 
-  /// 本地备份（整份配置）
-  static String? backupConfigLocal(String path) {
-    final cfg = _app.cleanConfig;
-    try {
-      File(path).writeAsStringSync(
-          const JsonEncoder.withIndent('  ').convert(cfg.toJson()),
-          flush: true);
-      return null;
-    } catch (e) {
-      return '未能写入备份文件：$e';
-    }
-  }
+  /// 本地备份（整份配置）：只生成 JSON 文本，落盘交给文件对话框
+  static String buildConfigJson() =>
+      const JsonEncoder.withIndent('  ').convert(_app.cleanConfig.toJson());
 
   /// 保存 WebDAV 设置（含密码，空密码不覆盖已有）
   static Future<String?> saveWebDAVConfig(

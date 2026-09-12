@@ -1,4 +1,6 @@
 ﻿// 分享导出（多选）、WebDAV 设置、导入/备份/还原等对话框（对齐 Wails/Mac 行为）。
+import 'dart:convert';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
@@ -85,12 +87,17 @@ Future<void> showShareDialog(BuildContext context) async {
   );
   if (confirmed != true || sel.isEmpty) return;
 
-  final path = await _saveFile('EchOS-servers.json', ['json']);
-  if (path == null) return;
-  final err = await ShareBackup.exportServers(sel.toList(), path);
+  final data = ShareBackup.buildServersJson(sel.toList());
+  final r = await _saveFile('EchOS-servers.json', ['json'], data.json);
+  if (!r.ok) {
+    if (r.err == null) return; // 用户取消
+    if (!context.mounted) return;
+    _alert(context, '导出失败', r.err!);
+    return;
+  }
+  app.log('已导出 ${data.count} 个服务器');
   if (!context.mounted) return;
-  _alert(context, err == null ? '导出成功' : '导出失败',
-      err ?? '已导出 ${sel.length} 台服务器');
+  _alert(context, '导出成功', '已导出 ${data.count} 台服务器');
 }
 
 /// 导入服务器（选 json 文件）
@@ -113,12 +120,16 @@ Future<void> showBackupDialog(BuildContext context) async {
   String two(int v) => v.toString().padLeft(2, '0');
   final stamp = '${now.year}${two(now.month)}${two(now.day)}-'
       '${two(now.hour)}${two(now.minute)}${two(now.second)}';
-  final path = await _saveFile('EchOS-备份-$stamp.json', ['json']);
-  if (path == null) return;
-  final err = ShareBackup.backupConfigLocal(path);
+  final r = await _saveFile(
+      'EchOS-备份-$stamp.json', ['json'], ShareBackup.buildConfigJson());
+  if (!r.ok) {
+    if (r.err == null) return; // 用户取消
+    if (!context.mounted) return;
+    _alert(context, '本地备份失败', r.err!);
+    return;
+  }
   if (!context.mounted) return;
-  _alert(context, err == null ? '本地备份成功' : '本地备份失败',
-      err ?? '已备份到本机');
+  _alert(context, '本地备份成功', '已备份到本机');
 }
 
 /// 本地还原：选备份文件并确认
@@ -289,24 +300,34 @@ Future<void> showWebDAVRemoveServer(BuildContext context) async {
 // 底层：文件对话框 + 提示
 // ---------------------------------------------------------------------------
 
-Future<String?> _saveFile(
-    String fileName, List<String> extensions) async {
-  final r = await FilePicker.saveFile(
-    dialogTitle: '保存文件',
-    fileName: fileName,
-    type: FileType.custom,
-    allowedExtensions: extensions,
-  );
-  return r;
+/// 弹出「另存为」对话框并落盘。
+/// file_picker 12 起 saveFile 必须直接给出内容、由插件负责写文件（Windows 实现里
+/// 就是 writeAsBytes），不再返回路径让调用方自己写；所以内容要先在调用方生成。
+/// 用户取消时 ok=false 且 err=null；写入出错时 err 为失败原因。
+Future<({bool ok, String? err})> _saveFile(
+    String fileName, List<String> extensions, String content) async {
+  try {
+    final uri = await FilePicker.saveFile(
+      dialogTitle: '保存文件',
+      fileName: fileName,
+      bytes: utf8.encode(content),
+      type: FileType.custom,
+      allowedExtensions: extensions,
+    );
+    return (ok: uri != null, err: null);
+  } catch (e) {
+    return (ok: false, err: '未能写入文件：$e');
+  }
 }
 
+/// 弹出「打开」对话框，返回所选文件路径；用户取消返回 null。
 Future<String?> _openFile(List<String> extensions) async {
-  final r = await FilePicker.pickFiles(
+  final f = await FilePicker.pickFile(
     dialogTitle: '选择文件',
     type: FileType.custom,
     allowedExtensions: extensions,
   );
-  return r?.files.single.path;
+  return f?.path;
 }
 
 Future<bool> _confirm(BuildContext context, String title, String message) async {
