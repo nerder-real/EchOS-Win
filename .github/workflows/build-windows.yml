@@ -213,15 +213,10 @@ jobs:
           }
           Write-Output '产物自检通过'
 
-      - uses: actions/upload-artifact@v6
-        with:
-          name: EchOS-Win-${{ env.APP_VERSION }}-x64
-          path: |
-            Output/EchOS-Win-${{ env.APP_VERSION }}-x64-Setup.exe
-            Output/EchOS-Win-${{ env.APP_VERSION }}-x64-Portable.exe
-            build/windows/x64/runner/Release/*
-          if-no-files-found: error
-          retention-days: 2   # 构建产物（安装包）仅保留 2 天
+      # 原先这里有一个 actions/upload-artifact 步骤，已移除：
+      # 成功时下面「发布 GitHub Release」已把两个安装包永久挂到 Release 上，
+      # artifact 只是 2 天后就删的冗余副本；失败时又因默认 success() 根本不上传，
+      # 两头都落空。去掉后可省下每版约 60MB 的 artifact 配额（免费额度 500MB）。
 
       - name: 发布 GitHub Release（带更新日志 + 两个安装包）
         # 推送 v* 标签 → 发布；手动触发 → 需勾选 publish_release。
