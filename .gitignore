@@ -58,6 +58,11 @@ EchOS-Win-*-Portable.exe
 **/config.json
 **/*.log
 **/*.db
+# 应用「本地备份」导出的配置（EchOS-备份-<时间戳>.json）。
+# 含全部服务器节点（地址/端口/UUID/token）、路由规则与 WebDAV 地址账号，
+# 敏感程度与 config.json 等同。上面那条 **/config.json 匹配不到这个名字，
+# 一旦导出到项目目录或事后拖进来，就会被 git add . 提交上去。
+EchOS-备份-*.json
 .idea/
 *.iml
 .flutter-plugins-dependencies
