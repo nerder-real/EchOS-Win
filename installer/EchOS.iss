@@ -46,6 +46,15 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "..\build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 
+; 卸载收尾兜底删掉整个安装目录。
+; Inno 只删它自己登记过的文件，凡卸载清单里没有的一律留下，目录就删不掉：
+;   1) 安装中断残留的 is-*.tmp（Inno 解压临时文件，正常安装结束会自清，
+;      异常中断则会永久留下）；
+;   2) 应用运行期间生成的任何文件。
+; 配合下面 [Code] 里 usUninstall 阶段先解决文件占用，这里才能干净删掉目录。
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}"
+
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
@@ -244,4 +253,68 @@ procedure DeinitializeSetup;
 begin
   if FileExists(GoMarkerPath) then
     DeleteFile(GoMarkerPath);
+end;
+
+// —— 卸载：先告知并征得同意 → 让应用优雅退出 → 兜底强杀 ——
+//
+// 背景（实测）：卸载时 EchOS 通常仍在托盘运行，echos.exe 及其依赖的
+// flutter_windows.dll、各插件 dll 处于占用状态，Inno 删除时报 code 5
+// (access denied)，结果就是「卸载完成了，安装目录还在」。安装侧早有
+// GoPage + taskkill 处理，卸载侧原先完全没做，这里补齐。
+//
+// 顺序很关键：必须先走授权标记让应用自己收尾，再考虑强杀。直接 taskkill
+// 会把系统代理留在「已接管」状态 —— 用户卸载完直接断网，比残留目录严重得多。
+
+// 第 1 步：卸载向导初始化时若发现应用在跑，先告知用户。
+// 放在这里而不是 usUninstall，是因为那时用户已经点过「确定卸载」，再弹框
+// 会很突兀；此处返回 False 即可干净地中止整个卸载，不留任何副作用。
+function InitializeUninstall(): Boolean;
+var
+  NL: string;
+begin
+  Result := True;
+  if not AppRunning then
+    Exit;
+  // 静默卸载（/VERYSILENT 等）不打断，交由 usUninstall 自动处理
+  if UninstallSilent then
+    Exit;
+  // 用 Chr() 而不是 #13#10 —— ISPP 预处理器会把 # 开头的 token 当成
+  // 预处理指令，直接写 #13 会报 "Unknown preprocessor directive"。
+  NL := Chr(13) + Chr(10);
+  Result := MsgBox('检测到 EchOS 正在运行。' + NL + NL +
+      '继续卸载会自动关闭 EchOS：先还原系统代理设置、停止内核进程，再退出。' + NL +
+      '若要保留当前连接，请先手动退出 EchOS 再重新卸载。' + NL + NL +
+      '是否继续卸载？',
+    mbConfirmation, MB_YESNO) = IDYES;
+end;
+
+// 第 2 步：真正执行退出。
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  i: Integer;
+  rc: Integer;
+  MarkerPath: string;
+begin
+  if CurUninstallStep = usUninstall then begin
+    MarkerPath := AddBackslash(GetTempDir) + GoMarkerFileName;
+    // 1) 先礼后兵：写授权标记，应用读到后会还原系统代理 → 停内核 → exit(0)。
+    //    最多等约 15 秒（75 × 200ms），与安装侧超时口径一致。
+    if AppRunning then begin
+      SaveStringToFile(MarkerPath, '1', False);
+      for i := 0 to 74 do begin
+        if not AppRunning then
+          Break;
+        Sleep(200);
+      end;
+    end;
+    // 2) 兜底：应用无响应/卡住时强制结束，保证文件不再被占用。
+    //    走到这里说明优雅退出已失败，代理状态不受控，但总比目录删不掉好。
+    Exec('taskkill.exe', '/IM echos.exe /F', '', SW_HIDE,
+      ewWaitUntilTerminated, rc);
+    Exec('taskkill.exe', '/IM x-tunnel.exe /F', '', SW_HIDE,
+      ewWaitUntilTerminated, rc);
+    Sleep(500);
+    if FileExists(MarkerPath) then
+      DeleteFile(MarkerPath);
+  end;
 end;

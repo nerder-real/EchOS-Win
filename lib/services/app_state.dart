@@ -1017,7 +1017,9 @@ if (\$path) { Write-Output ("{0}|{1}" -f \$ppid, \$path) }
     ];
     final proc = await Process.start(setupPath, args,
         mode: ProcessStartMode.detachedWithStdio);
-    await _spawnUpdateWatchdog(proc.pid, exePath);
+    // 把下载包路径一并交给看门狗：主进程马上 exit(0)，没机会也不能删
+    // （Setup 还在读这个文件），只有等 Setup 退出后才轮到看门狗清理。
+    await _spawnUpdateWatchdog(proc.pid, exePath, setupPath);
   }
 
   /// 更新看门狗：等 Setup 进程退出 → 等新进程起来 → 没起来就重新拉起 exePath。
@@ -1027,7 +1029,8 @@ if (\$path) { Write-Output ("{0}|{1}" -f \$ppid, \$path) }
   ///      的 `\"` 会转义掉闭合引号，整行被拆坏（实测报 `'hos.exe"'`、`'o'` 等）；
   ///   2) 写出去的文件是 UTF-8，cmd 按 GBK 解析，中文注释变乱码甚至产生杂字符。
   /// 改成 PowerShell + 参数列表后，引号一律由 Dart 负责，两条都规避掉了。
-  Future<void> _spawnUpdateWatchdog(int setupPid, String exePath) async {
+  Future<void> _spawnUpdateWatchdog(
+      int setupPid, String exePath, String setupPath) async {
     try {
       final dir = File(exePath).parent.path;
       final name = exePath
@@ -1041,6 +1044,22 @@ if (\$path) { Write-Output ("{0}|{1}" -f \$ppid, \$path) }
 $ErrorActionPreference = 'SilentlyContinue'
 $log = Join-Path $env:TEMP 'EchOS_UpdateWatch.log'
 Wait-Process -Id __PID__ -ErrorAction SilentlyContinue
+# 安装结束 -> 删除下载的安装包。Setup 刚退出时文件句柄可能还没完全释放，
+# 所以失败就等 1 秒重试，最多 10 次；真删不掉也只是留个文件，不影响使用。
+$setup = '__SETUP__'
+if ($setup -and (Test-Path -LiteralPath $setup)) {
+  for ($i = 0; $i -lt 10; $i++) {
+    try {
+      Remove-Item -LiteralPath $setup -Force -ErrorAction Stop
+      break
+    } catch {
+      Start-Sleep -Seconds 1
+    }
+  }
+  if (Test-Path -LiteralPath $setup) {
+    Add-Content -Path $log -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' WARN: keep download ' + $setup)
+  }
+}
 Start-Sleep -Seconds 8
 $p = Get-Process -Name '__NAME__' -ErrorAction SilentlyContinue
 $relaunched = 0
@@ -1054,7 +1073,9 @@ Add-Content -Path $log -Value $line
           .replaceAll('__PID__', '$setupPid')
           .replaceAll('__NAME__', name)
           .replaceAll('__EXE__', exePath)
-          .replaceAll('__DIR__', dir);
+          .replaceAll('__DIR__', dir)
+          // 单引号会提前闭合 PowerShell 字符串，转义成两个单引号
+          .replaceAll('__SETUP__', setupPath.replaceAll("'", "''"));
       // 必须用 normal，不能用 detached：Dart 的 detached 以「无控制台」方式创建
       // 进程，脚本宿主起不来（实测 detached 与 detachedWithStdio 均不执行，
       // normal 正常）。注意这**只针对该脚本宿主**——cmd.exe 在三种模式下都能
@@ -1116,6 +1137,7 @@ Add-Content -Path $log -Value $line
 setlocal
 set "TARGET=$hostPath"
 set "NEW=$newFile"
+set "SRC=$newPath"
 set "SELF=$selfPid"
 set "HOST=$hostPid"
 :waitSelf
@@ -1127,7 +1149,11 @@ ping 127.0.0.1 -n 2 >nul
 tasklist /FI "PID eq %HOST%" 2>nul | findstr "%HOST%" >nul
 if not errorlevel 1 goto waitHost
 move /Y "%NEW%" "%TARGET%" >nul 2>&1
-if not errorlevel 1 start "" "%TARGET%"
+if not errorlevel 1 (
+  start "" "%TARGET%"
+  rem 替换成功 -> 删掉下载目录里的更新包（每个约 30MB，不删会一直堆积）
+  del /F /Q "%SRC%" >nul 2>&1
+)
 del "%~f0"
 ''', flush: true);
     await Process.start('cmd.exe', ['/c', 'start', '/min', batPath],
