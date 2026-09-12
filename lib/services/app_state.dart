@@ -1047,10 +1047,11 @@ if (-not (Get-Process -Name '__NAME__' -ErrorAction SilentlyContinue)) {
           .replaceAll('__NAME__', name)
           .replaceAll('__EXE__', exePath)
           .replaceAll('__DIR__', dir);
-      // 必须用 normal，不能用 detached：powershell 是控制台程序，Dart 的 detached
-      // 以「无控制台」方式创建进程，powershell 起不来（实测 detached 与
-      // detachedWithStdio 均不执行，normal 正常）。Windows 上子进程独立于父进程，
-      // 主进程 exit(0) 后子进程照常跑完 —— 已实测确认。
+      // 必须用 normal，不能用 detached：Dart 的 detached 以「无控制台」方式创建
+      // 进程，脚本宿主起不来（实测 detached 与 detachedWithStdio 均不执行，
+      // normal 正常）。注意这**只针对该脚本宿主**——cmd.exe 在三种模式下都能
+      // 正常执行，所以 _selfReplacePortable 的 cmd + detached 无需改动。
+      // Windows 上子进程独立于父进程，主进程 exit(0) 后子进程照常跑完（已实测）。
       await Process.start(
         'powershell',
         [
