@@ -14,7 +14,6 @@ import 'platform_drivers.dart';
 import 'port_tools.dart';
 import 'self_check.dart';
 import 'system_proxy.dart';
-import 'app_temp.dart';
 import 'app_version.dart';
 import 'updater.dart';
 
@@ -1039,11 +1038,11 @@ if (\$path) { Write-Output ("{0}|{1}" -f \$ppid, \$path) }
           .last
           .replaceAll(RegExp(r'\.exe$', caseSensitive: false), '');
       // 纯 ASCII：不写中文注释，避免任何代码页问题。
-      // 末尾把执行结果追加到 %TEMP%\EchOS_UpdateWatch.log，便于事后确认
+      // 末尾把执行结果追加到日志目录的 EchOS_UpdateWatch.log，便于事后确认
       // 看门狗是否跑过、以及它判断要不要拉起。
       final script = r'''
 $ErrorActionPreference = 'SilentlyContinue'
-$log = Join-Path '__TMP__' 'EchOS_UpdateWatch.log'
+$log = Join-Path '__LOGDIR__' 'EchOS_UpdateWatch.log'
 Wait-Process -Id __PID__ -ErrorAction SilentlyContinue
 # 安装结束 -> 删除下载的安装包。Setup 刚退出时文件句柄可能还没完全释放，
 # 所以失败就等 1 秒重试，最多 10 次；真删不掉也只是留个文件，不影响使用。
@@ -1077,7 +1076,9 @@ Add-Content -Path $log -Value $line
           .replaceAll('__DIR__', dir)
           // 单引号会提前闭合 PowerShell 字符串，转义成两个单引号
           .replaceAll('__SETUP__', setupPath.replaceAll("'", "''"))
-          .replaceAll('__TMP__', appTempDirForScript().replaceAll("'", "''"));
+          // 看门狗日志归入应用日志目录 %APPDATA%\EchOS\logs，与其他日志在一起
+          .replaceAll(
+              '__LOGDIR__', LogService.instance.dir.path.replaceAll("'", "''"));
       // 必须用 normal，不能用 detached：Dart 的 detached 以「无控制台」方式创建
       // 进程，脚本宿主起不来（实测 detached 与 detachedWithStdio 均不执行，
       // normal 正常）。注意这**只针对该脚本宿主**——cmd.exe 在三种模式下都能
@@ -1132,7 +1133,9 @@ Add-Content -Path $log -Value $line
     await File(newPath).copy(newFile);
 
     final selfPid = pid;
-    final batPath = appTempFile('EchOS_Replace.bat');
+    // 真正的一次性文件：批处理启动后立即自我删除，用完即删，留在系统 Temp 即可
+    final batPath =
+        '${Directory.systemTemp.path}${Platform.pathSeparator}EchOS_Replace.bat';
     final bat = File(batPath);
     await bat.writeAsString('''@echo off
 setlocal

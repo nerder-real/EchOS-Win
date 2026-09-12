@@ -39,11 +39,16 @@ $root = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $rel  = Join-Path $root 'build\windows\x64\runner\Release'
 
-# 构建中间产物（便携版归档、SFX 模块、ResourceHacker）统一放 F:\WorkBuddy\Temp：
-# 不占 C 盘；目录在仓库之外，天然不会被 git 提交；SFX / ResourceHacker 缓存长期
-# 复用，系统临时目录被清理也不受影响。C:\Users\Zorro\go 与 %TEMP% 里的历史残留
-# 已清理，不要再往那两处写。
-$tmp = 'F:\WorkBuddy\Temp\go-build'
+# 构建中间产物（便携版归档、SFX 模块、ResourceHacker）统一放
+# F:\WorkBuddy\Temp\echos-build：不占 C 盘；目录在仓库之外，天然不会被 git 提交；
+# SFX / ResourceHacker 缓存长期复用，系统临时目录被清理也不受影响。
+# 注意：这里只放构建产物。Go 的模块缓存（GOPATH）在 C:\Go\gopath，跟工具链走，
+# 不要往这里挪；应用运行时数据（托盘图标、日志）在 %APPDATA%\EchOS，也不要放这。
+$tmp = 'F:\WorkBuddy\Temp\echos-build'
+if (-not (Test-Path 'F:\')) {
+    # 换机器/没有 F 盘时降级到项目下的 Temp\echos-build（已在 .gitignore 排除）
+    $tmp = Join-Path $root 'Temp\echos-build'
+}
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 function Find-Exe {

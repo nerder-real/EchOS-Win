@@ -81,3 +81,7 @@ _portable_build.tmp
 
 # WorkBuddy AI 工作区状态
 .workbuddy-ai/
+
+# 本地构建中间产物的降级目录（build_local.ps1 在无 F 盘时使用）。
+# 正常情况下走 F:\WorkBuddy\Temp\echos-build，不在仓库内，无需忽略。
+Temp/

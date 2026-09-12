@@ -5,8 +5,8 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'app_paths.dart';
 import 'app_state.dart';
-import 'app_temp.dart';
 
 class TrayService with TrayListener {
   static final TrayService instance = TrayService._();
@@ -178,7 +178,11 @@ class TrayService with TrayListener {
 
   /// 把打包的托盘图标写为临时文件供托盘显示（蓝=已接管，橙=未接管）
   Future<void> _writeIcons() async {
-    final dir = appTempSubDir('echos-tray');
+    // 托盘图标是应用每次启动都要加载的资源，不是临时文件，放应用数据目录
+    // %APPDATA%\EchOS\tray，与 config / logs 同在一处，不进任何 Temp 目录。
+    final dir = Directory(
+        '${AppPaths.appDataDir.path}${Platform.pathSeparator}tray');
+    dir.createSync(recursive: true);
 
     final blue = File('${dir.path}${Platform.pathSeparator}tray-blue.ico');
     final blueData = await rootBundle.load('assets/tray-blue.ico');
