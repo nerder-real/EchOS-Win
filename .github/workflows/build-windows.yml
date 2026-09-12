@@ -31,57 +31,28 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # 每次 tag 构建都会在**自己**的作用域里存一份 1.84 GB 的 Flutter SDK 副本，
-      # 而 Actions 缓存按 ref 隔离，这份副本永远不会被别的 ref 读到。
-      # 几个版本下来实测占满 11.12 GB（超过单仓库 10 GB 上限），
-      # 于是 GitHub 按 LRU 回收，连 main 分支的预热缓存都被清掉 —— 每次都冷启动。
-      # 这里在开头清掉非 main 作用域的缓存，把占用压回 ~3.7 GB。
-      # 必须放开头：缓存是在所有步骤之后的 post 阶段才保存的，放结尾会被覆盖回来。
-      - name: 清理 tag 作用域缓存（防占满 10 GB 配额）
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: pwsh
-        run: |
-          $resp = gh api "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100" 2>&1
-          # 别静默：403 时 --jq 管道只会拿到空串，会误报「没有需要清理的缓存」
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "列出缓存失败（多半是缺少 actions:write 权限）：$resp"
-            exit 0
-          }
-          $all = ($resp | ConvertFrom-Json).actions_caches
-          Write-Output ("清理前：{0} 条 / {1:N2} GB" -f $all.Count, (($all | Measure-Object -Property size_in_bytes -Sum).Sum / 1GB))
-          $dead = @($all | Where-Object { $_.ref -ne 'refs/heads/main' })
-          if ($dead.Count -eq 0) { Write-Output '没有需要清理的缓存'; exit 0 }
-          $n = 0; $freed = 0
-          foreach ($c in $dead) {
-            Write-Output "  - 删除 [$($c.ref)] $($c.key)  $([math]::Round($c.size_in_bytes / 1GB, 2)) GB"
-            gh api -X DELETE "/repos/$env:GITHUB_REPOSITORY/actions/caches/$($c.id)" | Out-Null
-            if ($LASTEXITCODE -eq 0) { $n++; $freed += $c.size_in_bytes }
-          }
-          Write-Output ("已清理 {0}/{1} 条非 main 作用域缓存，回收 {2:N2} GB" -f $n, $dead.Count, ($freed / 1GB))
-
+      # 关于缓存：本工作流只在打 v* 标签或手动触发时才跑。
+      # GitHub 的缓存**按 ref 隔离**——一次 tag 构建存下的缓存只有这个 tag 自己能读，
+      # 下个版本必然读不到（实测同一个 key 会同时出现 "Cache not found" 和
+      # "Cache saved"，就是各存各的）。既然读不到，缓存就只剩坏处：结束前还要
+      # 上传 1.8 GB 白占 10 GB 配额，逼得 GitHub 按 LRU 回收别的东西。
+      # 所以这里一律关闭缓存：代价是每次发版重新下载 SDK（约 80~140s），
+      # 换来不发版时零消耗、零配额占用，也不再有后台常驻任务。
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          # 锁死版本，别跟着 stable 漂：
-          #   1) 缓存 key 里含版本号（flutter-windows-stable-<版本>-x64-…），
-          #      stable 一升级 key 就变，main 上预热的缓存立刻失配，又退回冷启动；
-          #   2) 同一版本的 SDK 才能解析出同一套依赖，发版产物才可复现。
-          # 升级时**两处一起改**（本文件 + warm-cache.yml），否则 key 不同，预热白做。
+          # 锁死版本，别跟着 stable 漂：同一 SDK 才能解析出同一套依赖，
+          # 发版产物才可复现（否则哪天 stable 一升，依赖和产物都跟着变）。
           flutter-version: '3.47.4'
-          cache: true
+          cache: false
 
       - name: Setup Go (内核)
         if: hashFiles('third_party/x-tunnel/go.mod') != ''
         uses: actions/setup-go@v6
         with:
           go-version-file: third_party/x-tunnel/go.mod
-          # 不指定会报「Dependencies file is not found ... go.mod」并彻底禁用缓存：
-          # go.mod 在子目录，setup-go 默认只在仓库根找。指到 go.sum 才能缓存
-          # 模块与构建产物（内核每次编译都要重新拉全部依赖）。
-          cache-dependency-path: third_party/x-tunnel/go.sum
+          cache: false
 
       # 预期行为，别当故障排查：本工作流锁定 Flutter 3.47.4，其 Dart SDK 不满足仓库
       # pubspec.lock 里 meta 1.18.0 / vector_math 2.2.0 的最低要求，因此这里会把它们
