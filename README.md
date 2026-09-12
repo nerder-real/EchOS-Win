@@ -92,6 +92,7 @@ EchOS-Win/
 - `EchOS-Win-<版本>-x64-Portable.exe` 便携版（单文件自解压）
 
 > 内核需输出到 `windows/bundle/x-tunnel.exe`，构建时会自动拷到产物目录。
+> 需 Flutter **3.47.4**，与 CI 保持一致；低版本会把 `pubspec.lock` 里的 meta / vector_math 改回去。
 
 ## Worker 部署
 

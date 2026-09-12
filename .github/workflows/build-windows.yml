@@ -54,14 +54,19 @@ jobs:
           go-version-file: third_party/x-tunnel/go.mod
           cache: false
 
-      # 预期行为，别当故障排查：本工作流锁定 Flutter 3.47.4，其 Dart SDK 不满足仓库
-      # pubspec.lock 里 meta 1.18.0 / vector_math 2.2.0 的最低要求，因此这里会把它们
-      # 升到 1.19.0 / 2.4.2，日志表现为 "> meta 1.19.0 (was 1.18.0)" 和
-      # "Changed 2 dependencies!"。
-      # 这是 SDK 版本驱动的，**无法通过改 lock 消除**：本地 Flutter 3.44.9 的 Dart 3.12.2
-      # 装不上这两个新版本（pub upgrade 会报 incompatible with dependency constraints），
-      # 两边不可能共用一份 lock。
-      # 由于 flutter-version 已锁定，每次都由同一 SDK 解析 → 产物依然可复现。
+      # 这里不该出现 "> meta 1.19.0 (was 1.18.0)" 之类的升级输出：仓库里的
+      # pubspec.lock 已经是 1.19.0 / 2.4.2，pub get 应当原样接受、零改动。
+      # 若日志又冒出 "Changed 2 dependencies!"，说明有人用 Flutter 3.44.x 本地
+      # 跑过 pub get 并把 lock 改回去了（原因见下），把 lock 恢复即可。
+      #
+      # 为什么必须和本地同版本：meta / vector_math 由 **Flutter SDK 自己**声明，
+      #   Flutter 3.47.4 → packages/flutter/pubspec.yaml 写的是 ^1.18.3 / ^2.4.0（范围）
+      #   Flutter 3.44.9 → 写的是 1.18.0 / 2.2.0（精确钉死，pub 没有选择余地）
+      # 所以 3.44.9 一定解析出 1.18.0 / 2.2.0，和本工作流的 3.47.4 不可能共用一份 lock。
+      # 注意这与 Dart SDK 版本**无关**：meta 1.19.0 只要 Dart ^3.5.0、vector_math 2.4.2
+      # 只要 ^3.10.0，Dart 3.12.2 全都满足——是精确钉死挡住了，不是版本不够。
+      # 因此本地也统一到 3.47.4（见 README「本地构建」），flutter-version 已锁定
+      # → 每次同一 SDK 解析 → 产物可复现。
       - run: flutter pub get
       # 更新源随仓库自动走（Fork 用 github.repository 指向自己的仓库）。
       # 版本号同步注入三处，缺一会导致自动更新静默失效（详见 app_version.dart 注释）：
