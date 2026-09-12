@@ -13,6 +13,10 @@ class LogService {
   static const int maxCheckLines = 300;
   static const int rotateBytes = 8 * 1024 * 1024; // 8MB
   static const int selfcheckMaxBytes = 1024 * 1024; // 1MB
+  // error.log 的上限。它只在 startNewSession() 时清空，会话内持续报错又没有
+  // 大小检查就会一直涨（四个日志文件里原先唯一没有上限的）。错误日志正常量很小，
+  // 2MB 足够定位问题，超了先写一行标记再清空重写。
+  static const int errorMaxBytes = 2 * 1024 * 1024; // 2MB
 
   final List<String> logLines = [];
   final List<String> errorLines = [];
@@ -114,6 +118,15 @@ class LogService {
     try {
       final f = _error;
       if (f != null) {
+        // 与 selfcheck.log 同一套保护：超过上限就整体清空重写。
+        // 不留旧内容是为了让「最近的错误」始终可读——错误日志的价值在时效，
+        // 不像 selfcheck 需要看累计趋势。
+        if (f.existsSync() && f.lengthSync() > errorMaxBytes) {
+          await f.writeAsString(
+              '=== error.log 超过 ${errorMaxBytes ~/ 1024 ~/ 1024}MB，已清空重写 ===\n',
+              mode: FileMode.write,
+              flush: true);
+        }
         await f.writeAsString('$line\n', mode: FileMode.append, flush: true);
       }
     } catch (_) {}
