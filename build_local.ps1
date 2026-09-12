@@ -45,11 +45,22 @@ $rel  = Join-Path $root 'build\windows\x64\runner\Release'
 # 注意：这里只放构建产物。Go 的模块缓存（GOPATH）在 C:\Go\gopath，跟工具链走，
 # 不要往这里挪；应用运行时数据（托盘图标、日志）在 %APPDATA%\EchOS，也不要放这。
 $tmp = 'F:\WorkBuddy\Temp\echos-build'
-if (-not (Test-Path 'F:\')) {
-    # 换机器/没有 F 盘时降级到项目下的 Temp\echos-build（已在 .gitignore 排除）
-    $tmp = Join-Path $root 'Temp\echos-build'
+$tmpOk = $false
+if (Test-Path 'F:\') {
+    try {
+        New-Item -ItemType Directory -Force -Path $tmp -ErrorAction Stop | Out-Null
+        $tmpOk = $true
+    } catch {
+        # 光驱、断网的网络盘、无写权限等情况：盘符在但用不了，走降级
+        $tmpOk = $false
+    }
 }
-New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+if (-not $tmpOk) {
+    # 换机器/没有可用 F 盘时降级到项目下的 Temp\echos-build（已在 .gitignore 排除）
+    $tmp = Join-Path $root 'Temp\echos-build'
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+}
+Write-Host "  构建临时目录: $tmp" -ForegroundColor Gray
 
 function Find-Exe {
     param([string[]]$Candidates, [string]$Name)
