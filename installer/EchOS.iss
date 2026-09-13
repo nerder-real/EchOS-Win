@@ -234,6 +234,26 @@ end;
 // 卸载/安装在替换 x-tunnel.exe 前，无论来源（游离内核/旧版进程/崩溃残留）都
 // 无条件清一次：该文件和 exe 一样会被覆盖，进程占用即 DeleteFile code5。
 // 正常流程（应用在跑+已授权）此刻互斥体已释放，这里只是兜底补刀。
+
+// 刷新 Windows 图标缓存。
+//
+// 为什么需要：Explorer 是**按文件路径**缓存图标的。覆盖安装时 logo.ico 的
+// 内容换了、路径没换，Explorer 常常直接沿用缓存里的旧位图，桌面就还是脏的
+// —— 这也是「重装了还是老样子」的由来。
+//
+// 为什么只清缓存、不重启资源管理器：ie4uinit -ClearIconCache 会把缓存条目
+// 标记为失效，Explorer 下次绘制时自动重新提取图标，效果等价但温和得多。
+// 反过来，taskkill /f explorer 再拉起，很容易让任务栏、托盘通知区恢复不全
+// （表现为任务栏卡死或整个不显示），代价远大于收益。所以这里刻意不重启。
+procedure RefreshIconCache;
+var
+  rc: Integer;
+begin
+  // {sys} 在 64 位系统上是 System32（ ie4uinit.exe 所在处）
+  Exec(ExpandConstant('{sys}\ie4uinit.exe'), '-ClearIconCache', '',
+       SW_HIDE, ewWaitUntilTerminated, rc);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   rc: Integer;
@@ -253,6 +273,10 @@ begin
     SetCurrentDir(ExpandConstant('{app}'));
     Exec(ExpandConstant('{app}\{#MyAppExeName}'), '', '', SW_SHOW, ewNoWait, rc);
   end;
+  // 快捷方式建好/更新之后刷新图标缓存（只清缓存，不重启 explorer，
+  // 理由见 RefreshIconCache 处的说明）。
+  if CurStep = ssPostInstall then
+    RefreshIconCache;
 end;
 
 procedure DeinitializeSetup;

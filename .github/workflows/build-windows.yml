@@ -163,7 +163,10 @@ jobs:
               Select-Object -First 1 -ExpandProperty FullName
           }
           if ($rh -and (Test-Path $rh)) {
-            & $rh -open $sfx -save $sfx -action addoverwrite -res "installer/logo.ico" -mask "ICONGROUP,MAINICON," | Out-Null
+            # mask 必须是 ICONGROUP,101 而不是 MAINICON：7zSD 系列 SFX 自带的图标
+            # 组 id 就是 101，用 MAINICON 只会「新增」一个组而不覆盖它，Windows 按
+            # id 升序取第一个组，便携版就会继续显示 7-Zip 图标。
+            & $rh -open $sfx -save $sfx -action addoverwrite -res "installer/logo.ico" -mask "ICONGROUP,101," | Out-Null
             Write-Output "已替换 SFX 图标 -> $rh"
           } else {
             Write-Warning '未取得 ResourceHacker，便携版沿用 SFX 默认图标（不影响功能）'

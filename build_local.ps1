@@ -203,9 +203,12 @@ if (-not (Test-Path $sfx)) {
     Copy-Item $sfxSrc $sfx -Force
     # 4.3 用 LOGO 替换 SFX 图标（ResourceHacker 只换资源，不改可执行功能）
     $rh = Join-Path $tmp 'reshacker\ResourceHacker.exe'
+    # mask 必须是 ICONGROUP,101 而不是 MAINICON：7zSD 系列 SFX 自带的图标组 id
+    # 就是 101，用 MAINICON 只会「新增」一个组而不覆盖它，Windows 按 id 升序取
+    # 第一个组，便携版就会继续显示 7-Zip 图标。换 SFX 模块时需重新确认这个 id。
     if (Test-Path $rh) {
         & $rh -open "$sfx" -save "$sfx" -action addoverwrite `
-              -res (Join-Path $root 'installer\logo.ico') -mask 'ICONGROUP,MAINICON,' | Out-Null
+              -res (Join-Path $root 'installer\logo.ico') -mask 'ICONGROUP,101,' | Out-Null
     } else {
         Write-Warning '未找到 ResourceHacker，便携版将使用 SFX 默认图标'
     }
