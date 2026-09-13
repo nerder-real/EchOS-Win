@@ -775,56 +775,65 @@ class _ModeSegment extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final app = AppState.instance;
-    final t = Theme.of(context);
-    return Container(
-      height: 34,
-      padding: const EdgeInsets.all(3),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(9),
-        color: EchTheme.inputBg(t),
-        border: Border.all(color: EchTheme.cardBorder(t)),
-      ),
-      child: Row(children: [
-        for (final m in RouteMode.values) ...[
-          Expanded(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => app.switchRouteMode(m),
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 180),
-                curve: Curves.easeOut,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(7),
-                  gradient: app.config.routeMode == m
-                      ? EchTheme.blueGradient()
-                      : null,
-                  boxShadow: app.config.routeMode == m
-                      ? [
-                          BoxShadow(
-                            color: EchTheme.blue.withValues(alpha: 0.35),
-                            blurRadius: 8,
-                            offset: const Offset(0, 2),
-                          ),
-                        ]
-                      : [],
-                ),
-                child: Center(
-                  child: Text(m.title,
-                      style: TextStyle(
-                          fontSize: EchTheme.fsSegment,
-                          color: app.config.routeMode == m
-                              ? Colors.white
-                              : EchTheme.inputText(t),
-                          fontWeight: app.config.routeMode == m
-                              ? EchTheme.fwTitle
-                              : EchTheme.fwContent,
-                          letterSpacing: EchTheme.letterSpacing)),
+    // 必须自己订阅 AppState：本控件以 const 实例挂在主页上，父级重建时 Flutter
+    // 会因为 widget 实例相同（identical）而跳过它，导致切换分流模式后高亮不跟随
+    // （看起来像「点了没反应」）。用 AnimatedBuilder 订阅后，任何来源的状态
+    // 变化都能刷新这里，不必依赖父级恰好重建。
+    return AnimatedBuilder(
+      animation: app,
+      builder: (context, _) {
+        final t = Theme.of(context);
+        return Container(
+          height: 34,
+          padding: const EdgeInsets.all(3),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(9),
+            color: EchTheme.inputBg(t),
+            border: Border.all(color: EchTheme.cardBorder(t)),
+          ),
+          child: Row(children: [
+            for (final m in RouteMode.values) ...[
+              Expanded(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => app.switchRouteMode(m),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 180),
+                    curve: Curves.easeOut,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(7),
+                      gradient: app.config.routeMode == m
+                          ? EchTheme.blueGradient()
+                          : null,
+                      boxShadow: app.config.routeMode == m
+                          ? [
+                              BoxShadow(
+                                color: EchTheme.blue.withValues(alpha: 0.35),
+                                blurRadius: 8,
+                                offset: const Offset(0, 2),
+                              ),
+                            ]
+                          : [],
+                    ),
+                    child: Center(
+                      child: Text(m.title,
+                          style: TextStyle(
+                              fontSize: EchTheme.fsSegment,
+                              color: app.config.routeMode == m
+                                  ? Colors.white
+                                  : EchTheme.inputText(t),
+                              fontWeight: app.config.routeMode == m
+                                  ? EchTheme.fwTitle
+                                  : EchTheme.fwContent,
+                              letterSpacing: EchTheme.letterSpacing)),
+                    ),
+                  ),
                 ),
               ),
-            ),
-          ),
-        ],
-      ]),
+            ],
+          ]),
+        );
+      },
     );
   }
 }

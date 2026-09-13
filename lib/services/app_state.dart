@@ -501,17 +501,24 @@ class AppState extends ChangeNotifier {
 
   Future<void> switchRouteMode(RouteMode mode) async {
     if (config.routeMode == mode) return;
+    final from = config.routeMode;
     config.routeMode = mode;
     persist();
-    _log('分流模式已切换为「${mode.title}」');
+    // 带上「从哪个模式切过来」，只看目标模式无法判断切换是否真的发生
+    _log('[系统] 分流模式：「${from.title}」→「${mode.title}」');
     // 先通知：重启期间 UI 立即高亮新模式，不等 stop/start 跑完。
     notifyListeners();
     // 运行中或启动中都必须重启，否则新路由不生效。只判 isRunning 会漏掉
     // 启动中切换——在途的 start() 可能已按旧模式读走路由，须重启落地新模式。
-    if (!isRunning && !isStarting) return;
-    _log('[系统] 正在按「${mode.title}」重启代理…');
+    if (!isRunning && !isStarting) {
+      _log('[系统] 代理未运行，「${mode.title}」将在下次启动时生效');
+      return;
+    }
+    _log('[系统] 代理运行中，正在按「${mode.title}」重启…');
     await stop();
     await start();
+    // 补一条结果：否则重启失败时日志停在「正在重启」，看不出到底成没成
+    _log('[系统] 重启结束：模式「${mode.title}」，代理${isRunning ? '已恢复运行' : '未在运行，请查看上方报错'}');
   }
 
   Future<void> resolvePortConflictByKilling() async {
