@@ -407,9 +407,21 @@ class AppState extends ChangeNotifier {
     if (isRunning) {
       rulesDirty = false;
       _refreshStatusText();
-      // 对齐 Mac：端口就绪先标记运行中，但暂不接管系统代理（proxyReady=false，
-      // 托盘保持橙）。自检通过后（见 _presentCheckResults）才接管 → 托盘变蓝，
-      // 避免"隧道其实不通却已把浏览器流量导入"的假成功。
+      // 端口就绪就接管系统代理，不等自检。
+      //
+      // 以前是「自检通过后才接管」（对齐 Mac 的做法），本意是避免「隧道其实不通
+      // 却已把浏览器流量导入」的假成功。代价很实在：自检要跑隧道探针，节点慢的
+      // 时候能拖十几秒（实测一次启动从端口就绪到接管隔了 22 秒），这段时间系统
+      // 代理是关的，浏览器直连，境外站点全挂 —— 用户感知就是「启动代理后好一阵
+      // 上不了网」。
+      //
+      // 现在把两件事解耦：start() 只管「把代理跑起来、让流量进来」，自检只负责
+      // 回答「这条隧道到底通不通」，不通就回滚。回滚路径是现成的 ——
+      // _presentCheckResults 发现隧道失败会走 stop()，而 stop() 会自动还原系统
+      // 代理，不会留下指向死端口的代理设置。
+      if (config.autoSystemProxy && !proxyTakenOver) {
+        await enableSystemProxy();
+      }
       if (checking == false) {
         // 启动后自动跑的自检：隧道探针失败 → 视为启动失败，由 _presentCheckResults
         // 关闭代理（否则「端口就绪但隧道不通」会一直挂着个死代理）。
@@ -773,11 +785,12 @@ class AppState extends ChangeNotifier {
     final failed = results.where((r) => !r.ok).toList();
     if (failed.isEmpty) {
       checkState = CheckState.ok(results.map((r) => '${r.title}：${r.note}').join('\n'));
-      // 对齐 Mac：自检通过后才接管系统代理（proxyReady=true → 托盘变蓝）。
-      // 仅当代理在运行且配置开启自动接管时接管，避免代理未启动的预检误接管。
+      // 系统代理已在 start() 里端口就绪时接管过（见那里的注释），这里不再重复。
+      // 兜底：万一那次没接上（比如当时 autoSystemProxy 还是关的、后来才打开），
+      // 补一次，保证「代理在跑」和「系统代理已接管」最终一致。
       if (isRunning && config.autoSystemProxy && !proxyTakenOver) {
         _log('[系统] 自检通过，正在接管系统代理…');
-        enableSystemProxy();
+        await enableSystemProxy();
       }
       return;
     }

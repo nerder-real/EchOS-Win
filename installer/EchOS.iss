@@ -45,6 +45,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
+; 单独装一份 ico 到 {app}：桌面/开始菜单快捷方式改为显式指向它（见 [Icons]）。
+; 不写 IconFilename 时，Windows 得先从 echos.exe 里抠图标、再进图标缓存，
+; 抠图和缓存任一环节出问题（重装时 exe 正在被替换最容易中招），桌面就显示成
+; 残影/杂色/拉伸的低清图。显式给 ico 路径后就与 exe 解耦，装完即是干净的。
+Source: "logo.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 ; 卸载收尾兜底删掉整个安装目录。
 ; Inno 只删它自己登记过的文件，凡卸载清单里没有的一律留下，目录就删不掉：
@@ -56,8 +61,9 @@ Source: "..\build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: ignore
 Type: filesandordirs; Name: "{app}"
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+; IconFilename 显式指向随包安装的 logo.ico，不靠 Windows 从 exe 抠图 + 缓存
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\logo.ico"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\logo.ico"; Tasks: desktopicon
 
 [Run]
 ; 仅交互安装走完成页的复选框；静默安装由 [Code] 的 CurStepChanged 负责拉起，
