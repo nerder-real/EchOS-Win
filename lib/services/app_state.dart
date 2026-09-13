@@ -65,6 +65,12 @@ class AppState extends ChangeNotifier {
   bool checking = false;
   bool proxyTakenOver = false;
   bool proxyReady = false;
+  // 内核进程代号，每次启动新内核时递增。
+  // 存在的理由：stop→start（切换分流模式就是这条路径）时，旧内核被 kill 后它的
+  // exitCode future 仍会完成并触发 onExit 回调，且往往晚到——此时新内核已经起来。
+  // 没有代号区分的话，旧回调会把新内核的 isRunning 打回 false，还会把系统代理
+  // 拆掉（切换模式期间我们刻意保留系统代理，见 switchRouteMode）。
+  int _kernelGen = 0;
   // 仅对「启动/切换后自动跑的那次自检」置位：隧道探针失败即视为启动失败，关闭代理。
   // 手动自检/预检不带动这开关，保持和 Mac 一致（不打扰已正在跑的代理）。
   bool _autoStartCheckCloses = false;
@@ -233,8 +239,7 @@ class AppState extends ChangeNotifier {
   Future<void> restartProxy() async {
     if (!isRunning && !isStarting) return;
     _log('参数已保存，正在重启代理以应用新配置…');
-    await stop();
-    await start();
+    await _restartKernel();
   }
 
   /// 起名/改名；返回错误文案
@@ -290,8 +295,7 @@ class AppState extends ChangeNotifier {
     // 的内核停掉再用新服务器重启 —— 否则 UI 已切到新服务器，跑起来的却是旧服务器。
     if ((isRunning || isStarting) && selected != null) {
       _log('已切换服务器，正在重启代理（会短暂断开）…');
-      await stop();
-      await start();
+      await _restartKernel();
     } else {
       notifyListeners();
     }
@@ -344,8 +348,12 @@ class AppState extends ChangeNotifier {
     }
 
     _log('正在启动内核进程…');
+    final gen = ++_kernelGen;
     final startErr = await KernelManager.instance.start(s, config.routeMode,
         log: onLog, rules: config.customRules, onExit: (code) {
+      // 旧内核的迟到回调：新内核已经顶上（或已重新走完一轮），这次退出与我们无关，
+      // 忽略即可。否则会把新内核的 isRunning 打回 false、并拆掉系统代理。
+      if (gen != _kernelGen) return;
       // 内核退出 → 同步 App 状态（灯/文案/系统代理），避免 UI 仍显示运行中
       isRunning = false;
       isStarting = false;
@@ -412,15 +420,43 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> stop() async {
+  /// [keepSystemProxy] = true 时只停内核，不动系统代理设置。
+  /// 用于「重启内核但端口不变」的场景（切换分流模式）：端口 30000/30001 是固定的，
+  /// 新内核起来后系统代理依然有效，没必要先还原再接管——那中间几秒系统代理是关的，
+  /// 走系统代理的程序会直连境外域名超时，看起来就像断网。
+  Future<void> stop({bool keepSystemProxy = false}) async {
     isStarting = false;
     _autoStartCheckCloses = false; // 启动被中止后不再消费“关闭代理”标记
-    if (proxyTakenOver) await disableSystemProxy();
+    // 代号 +1：旧内核被 kill 后其 exitCode future 仍会完成并触发 onExit 回调，
+    // 有了代号差就能把这次「预期内的退出」忽略掉，不会误清新内核的状态。
+    _kernelGen++;
+    if (proxyTakenOver && !keepSystemProxy) await disableSystemProxy();
     await KernelManager.instance.stop();
     isRunning = false;
     checkState = const CheckState.idle();
     _refreshStatusText();
     notifyListeners();
+  }
+
+  /// 「重启内核以应用新配置」的统一入口：切换分流模式 / 切换服务器 / 应用自定义
+  /// 规则 / 保存参数后重启，都走这里。
+  ///
+  /// 关键点：**重启期间不拆系统代理**。本地端口（30000/30001）是固定的，新内核
+  /// 起来后原来的系统代理设置依然有效；而一旦走「先还原、等自检通过再接管」，中间
+  /// 那 2~6 秒系统代理是关的（备份里 enable=false），此时走系统代理的程序会直连
+  /// 境外域名并超时 —— 表现就是「我什么都没干，网络突然断了」。
+  /// 内核重启本身确实有 1~6 秒空档，但那时程序拿到的是 connection refused（快速
+  /// 失败、会自己重试），远好过几十秒的直连超时。
+  Future<void> _restartKernel() async {
+    await stop(keepSystemProxy: true);
+    await start();
+    // start() 有多条提前 return 的失败路径（没选服务器 / 配置不完整或未保存 /
+    // 内核起不来 / 端口被占 / 端口一直未就绪）。任何一条都会留下「系统代理指向
+    // 已经死了的本地端口」，比直接断网更糟，所以这里必须兜底还原。
+    if (!isRunning && proxyTakenOver) {
+      _log('[系统] 重启后代理未运行，正在还原系统代理，避免流量指向已失效的端口…');
+      await disableSystemProxy();
+    }
   }
 
   Future<void> toggle() async {
@@ -515,8 +551,9 @@ class AppState extends ChangeNotifier {
       return;
     }
     _log('[系统] 代理运行中，正在按「${mode.title}」重启…');
-    await stop();
-    await start();
+    // 重启期间保留系统代理（理由见 _restartKernel）：这正是「切个分流模式
+    // WorkBuddy 就断网」的根因所在。
+    await _restartKernel();
     // 补一条结果：否则重启失败时日志停在「正在重启」，看不出到底成没成
     _log('[系统] 重启结束：模式「${mode.title}」，代理${isRunning ? '已恢复运行' : '未在运行，请查看上方报错'}');
   }
@@ -683,8 +720,7 @@ class AppState extends ChangeNotifier {
       return;
     }
     _log('应用新的分流规则，正在重启代理（会短暂断开）…');
-    await stop();
-    await start();
+    await _restartKernel();
     rulesDirty = false;
     notifyListeners();
   }

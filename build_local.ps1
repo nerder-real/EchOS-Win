@@ -224,5 +224,26 @@ try {
 } finally { $fs.Close() }
 
 Write-Host "  便携版: $out" -ForegroundColor Green
+
+# 4.5 防伪自检：SFX 里嵌的归档必须和刚构建的 Release 一致。
+# 为什么需要：便携版是「SFX 模块 + 配置 + 7z 归档」三段拼接，归档是个独立中间文件。
+# 一旦归档是旧的（比如手工分阶段跑构建时传错路径、写到别处去了），拼出来的 exe
+# 大小和平时差不多、也能正常安装运行，但装的是上一版代码 —— 不报任何错，极难发现。
+# 这里把 SFX 里的 app.so 抽出来和 Release 的逐字节比，对不上就直接构建失败。
+$verifyDir = Join-Path $tmp 'verify'
+Remove-Item -LiteralPath $verifyDir -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
+& $7z e "$out" "-o$verifyDir" 'data\app.so' -y | Out-Null
+$packedApp = Join-Path $verifyDir 'app.so'
+if (-not (Test-Path $packedApp)) {
+    throw "便携版自检失败：没能从 $out 里抽出 data\app.so"
+}
+$srcApp = Join-Path $rel 'data\app.so'
+$h1 = (Get-FileHash $packedApp -Algorithm MD5).Hash
+$h2 = (Get-FileHash $srcApp   -Algorithm MD5).Hash
+if ($h1 -ne $h2) { throw "便携版自检失败：包内 app.so($h1) 与 Release($h2) 不一致，归档可能是旧的" }
+Write-Host "  便携版自检通过（app.so md5 $h1 与 Release 一致）" -ForegroundColor Green
+Remove-Item -LiteralPath $verifyDir -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host ''
 Write-Host '全部完成。' -ForegroundColor Cyan
