@@ -168,8 +168,25 @@ jobs:
             # id 升序取第一个组，便携版就会继续显示 7-Zip 图标。
             & $rh -open $sfx -save $sfx -action addoverwrite -res "installer/logo.ico" -mask "ICONGROUP,101," | Out-Null
             Write-Output "已替换 SFX 图标 -> $rh"
+
+            # 版本资源。不做这步，右键「属性 → 详细信息」显示的是 SFX 模板自带的
+            # 7-Zip 信息（1.7.0.3900 / Oleg N. Scherbakov）。
+            # 模板里的 LANGUAGE 必须是中性 (0,0)：SFX 原资源就在 000004b0 块里，
+            # 注入成 040904b0（英文）时中文系统会回退到中性块，读到的还是 7-Zip
+            # —— 实测确认过。
+            $verDot = $ver.TrimStart('v')
+            $verComma = ($verDot -split '\.') -join ','
+            if (($verDot -split '\.').Count -lt 4) { $verComma = "$verComma,0" }
+            $content = (Get-Content -LiteralPath 'installer/portable-version.rc.tpl' -Raw -Encoding UTF8) `
+              -replace '@VER_DOT@', $verDot `
+              -replace '@VER_COMMA@', $verComma
+            # 无 BOM UTF-8：带 BOM 时 ResourceHacker 编译可能报错
+            [IO.File]::WriteAllText("$env:TEMP\portable-version.rc", $content, (New-Object Text.UTF8Encoding $false))
+            & $rh -open "$env:TEMP\portable-version.rc" -save "$env:TEMP\portable-version.res" -action compile | Out-Null
+            & $rh -open $sfx -save $sfx -action addoverwrite -res "$env:TEMP\portable-version.res" -mask "VERSIONINFO,," | Out-Null
+            Write-Output "已替换 SFX 版本资源 -> $verDot"
           } else {
-            Write-Warning '未取得 ResourceHacker，便携版沿用 SFX 默认图标（不影响功能）'
+            Write-Warning '未取得 ResourceHacker，便携版沿用 SFX 默认图标与版本信息（不影响功能）'
           }
           # 4) 官方规范拼接：SFX 模块 + 配置 + 归档（运行时解压到临时目录→运行 echos.exe→退出后清理，Progress=no 无解压弹窗）
           $out = Join-Path (Get-Location) "Output\EchOS-Win-$ver-x64-Portable.exe"

@@ -8,10 +8,28 @@
 #endif
 #define MyAppExeName "echos.exe"
 
+; PE 版本资源用的四段数字版本（VS_FIXEDFILEINFO 要求 x.x.x.x）。
+; APP_VERSION 形如 v1.0.9，这里去掉前缀 v 再补一段 0 → 1.0.9.0。
+; 不设 VersionInfoVersion 的话 Inno 会写 0.0.0.0 —— 因为 AppVersion 带 v 前缀，
+; 无法解析成数字，结果资源管理器「属性 → 详细信息」里文件版本是空的。
+#define MyVerBase StringChange(MyAppVersion, "v", "")
+#define MyVerQuad MyVerBase + ".0"
+
 [Setup]
 AppId={{40D4E6C1-7A3B-4F0E-9C5A-8B2E6E9D4C10}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+; —— 版本资源：资源管理器「属性 → 详细信息」里显示的内容 ——
+; VersionInfoVersion / VersionInfoProductVersion 必须是四段数字；
+; 不写就是 0.0.0.0（用户反馈的「文件版本 0.0.0.0」就是这里漏了）。
+VersionInfoVersion={#MyVerQuad}
+VersionInfoCompany=dev.echos
+VersionInfoDescription=EchOS Setup
+VersionInfoCopyright=Copyright (C) 2026 dev.echos. All rights reserved.
+VersionInfoProductName=EchOS
+VersionInfoProductVersion={#MyVerQuad}
+VersionInfoProductTextVersion={#MyVerBase}
+VersionInfoTextVersion={#MyVerBase}
 DefaultDirName={autopf}\EchOS
 DefaultGroupName=EchOS
 OutputDir=..\Output

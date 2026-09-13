@@ -191,7 +191,9 @@ Invoke-Checked '7z 压缩'
 Pop-Location
 
 # 4.2 SFX 模块（需支持 ;!@Install@! 配置，故用 7zSD 而非 7-Zip 自带的 7z.sfx）
-$sfx = Join-Path $tmp 'iconed.sfx'
+# 文件名带版本号：图标和版本资源都是按当前版本注入的，换版本必须重新生成，
+# 否则会沿用上一版注入了旧版本号的缓存模块。
+$sfx = Join-Path $tmp "iconed-$Version.sfx"
 if (-not (Test-Path $sfx)) {
     $sfxSrc = Join-Path $tmp '7zsd_x\7zsd_LZMA2_x64.sfx'
     if (-not (Test-Path $sfxSrc)) {
@@ -201,16 +203,36 @@ if (-not (Test-Path $sfx)) {
         & $7z x "$dl" "-o$(Join-Path $tmp '7zsd_x')" -y | Out-Null
     }
     Copy-Item $sfxSrc $sfx -Force
-    # 4.3 用 LOGO 替换 SFX 图标（ResourceHacker 只换资源，不改可执行功能）
+    # 4.3 用 ResourceHacker 替换 SFX 的两套资源（只改资源，不动可执行功能）
     $rh = Join-Path $tmp 'reshacker\ResourceHacker.exe'
-    # mask 必须是 ICONGROUP,101 而不是 MAINICON：7zSD 系列 SFX 自带的图标组 id
-    # 就是 101，用 MAINICON 只会「新增」一个组而不覆盖它，Windows 按 id 升序取
-    # 第一个组，便携版就会继续显示 7-Zip 图标。换 SFX 模块时需重新确认这个 id。
     if (Test-Path $rh) {
+        # 4.3a 图标。mask 必须是 ICONGROUP,101 而不是 MAINICON：7zSD 系列 SFX
+        # 自带的图标组 id 就是 101，用 MAINICON 只会「新增」一个组而不覆盖它，
+        # Windows 按 id 升序取第一个组，便携版就会继续显示 7-Zip 图标。
+        # 换 SFX 模块时需重新确认这个 id。
         & $rh -open "$sfx" -save "$sfx" -action addoverwrite `
               -res (Join-Path $root 'installer\logo.ico') -mask 'ICONGROUP,101,' | Out-Null
+
+        # 4.3b 版本资源。不做这步，右键「属性 → 详细信息」显示的是 SFX 模板自带的
+        # 7-Zip 信息（1.7.0.3900 / Oleg N. Scherbakov）。
+        # 模板里的 LANGUAGE 必须是中性 (0,0)：SFX 原资源就在 000004b0 块里，
+        # 若注入成 040904b0（英文），中文系统找不到匹配语言会回退到中性块，
+        # 读到的仍然是 7-Zip —— 实测确认过。
+        $tpl = Join-Path $root 'installer\portable-version.rc.tpl'
+        $rc  = Join-Path $tmp "portable-version-$Version.rc"
+        $res = Join-Path $tmp "portable-version-$Version.res"
+        $verComma = ($Version -split '\.') -join ','
+        if (($Version -split '\.').Count -lt 4) { $verComma = "$verComma,0" }
+        $content = (Get-Content -LiteralPath $tpl -Raw -Encoding UTF8) `
+            -replace '@VER_DOT@', $Version `
+            -replace '@VER_COMMA@', $verComma
+        # 写无 BOM 的 UTF-8：带 BOM 时 ResourceHacker 编译可能报错
+        [IO.File]::WriteAllText($rc, $content, (New-Object Text.UTF8Encoding $false))
+        & $rh -open "$rc" -save "$res" -action compile | Out-Null
+        & $rh -open "$sfx" -save "$sfx" -action addoverwrite `
+              -res "$res" -mask 'VERSIONINFO,,' | Out-Null
     } else {
-        Write-Warning '未找到 ResourceHacker，便携版将使用 SFX 默认图标'
+        Write-Warning '未找到 ResourceHacker，便携版将沿用 SFX 默认图标与版本信息'
     }
 }
 
