@@ -648,7 +648,11 @@ class AppState extends ChangeNotifier {
     for (final w in warns) {
       _log('[系统代理] $w');
     }
-    _log('已还原为你原来的设置');
+    // 说清还原到的是「关」还是「沿用原设置」：以前只写「已还原为你原来的设置」，
+    // 而多数用户的原始状态其实是「没开代理」，日志看起来就像还原到了某个陌生地址。
+    _log(SystemProxy.savedWasEnabled
+        ? '已还原为你原来的设置（系统代理：沿用接管前的配置）'
+        : '已还原为你原来的设置（系统代理：关闭）');
     _refreshProxySummary();
     notifyListeners();
   }

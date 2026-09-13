@@ -69,11 +69,23 @@ class SystemProxy {
     }
   }
 
+  /// 接管前系统代理是否处于启用状态（仅供日志/提示使用）
+  static bool get savedWasEnabled => _savedProxyEnable;
+
   /// 还原系统代理到接管前的状态
   static Future<List<String>> restore() async {
     await _regSet(_regKey, 'ProxyEnable', _savedProxyEnable ? 1 : 0);
-    if (_savedProxyServer.isNotEmpty) {
+    if (_savedProxyEnable && _savedProxyServer.isNotEmpty) {
+      // 只有「接管前确实开着代理」才写回地址 —— 那是用户真在用的配置。
       await _regSetSz(_regKey, 'ProxyServer', _savedProxyServer);
+    } else if (!_savedProxyEnable) {
+      // 接管前代理本来就是关的：注册表里那个 ProxyServer 多半是别的代理工具
+      // （v2rayN / Clash 等）退出时留下的僵尸值，比如 127.0.0.1:10808。
+      // 代理关着时它不生效，但留着有两个坏处：
+      //   1) 日志和系统设置里看起来像「还原到了一个陌生地址」，平白引起误解；
+      //   2) 用户日后手动打开系统代理开关时，会意外连到这个早就不存在的地址。
+      // 所以这里删掉，还原成「干净的未启用」状态。
+      await _regDelete(_regKey, 'ProxyServer');
     }
     // 2-4：恢复用户原有绕过列表；原无则删除（避免残留 <local>）
     if (_savedProxyOverride != null) {
