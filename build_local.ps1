@@ -18,6 +18,14 @@
     版本号，形如 1.0.1。同时注入到三处：ECHOS_VERSION / --build-name /
     ISCC /DAPP_VERSION。必须与即将打的 v* 标签一致，否则自动更新会静默失效。
 
+    脚本开头会做版本一致性预检：与 pubspec.yaml、lib/services/app_version.dart
+    比对。**低于 pubspec 版本时按「本地测试包」处理，只警告不阻断**，
+    所以默认的 -Version 1.0.0 照常可用；高于或不一致时会报错退出。
+
+.PARAMETER AllowVersionMismatch
+    跳过版本一致性预检的硬性失败。只在「确实要构建一个版本号对不上的包、
+    且确定不会拿它发版」时使用。
+
 .PARAMETER Repo
     更新源 owner/repo，注入 ECHOS_REPO。
 
@@ -29,7 +37,8 @@
 param(
     [string]$Version = '1.0.0',
     [string]$Repo    = 'nerder-real/EchOS-Win',
-    [switch]$SkipPortable
+    [switch]$SkipPortable,
+    [switch]$AllowVersionMismatch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,6 +87,69 @@ function Invoke-Checked {
 }
 
 Write-Host "版本: $Version    更新源: $Repo" -ForegroundColor White
+Write-Host ''
+
+# ---------- 版本一致性预检 ----------
+# 版本号散落在三处，任一处漏改都可能让「自动更新」静默失效（自报版本 ≥ Release
+# 标签时，客户端永远判定「已是最新版本」，且不报任何错）：
+#   1. -Version          本次构建注入的版本（exe 资源 + 应用自报版本）
+#   2. pubspec.yaml      version: 1.0.9+10
+#   3. app_version.dart  defaultValue: '1.0.9'（只在没传 --dart-define 时生效）
+#
+# 判定规则 —— 刻意不对「本地测试包」设卡，否则默认的 -Version 1.0.0 直接不可用：
+#   三者一致                    → 通过
+#   $Version 低于 pubspec 版本  → 判定为本地测试包，警告后继续
+#   其余不一致                  → 报错退出（可用 -AllowVersionMismatch 跳过）
+$reSemver    = '(\d+(?:\.\d+)*)'
+$pubspecFile = Join-Path $root 'pubspec.yaml'
+$dartFile    = Join-Path $root 'lib\services\app_version.dart'
+
+$pubspecVer = $null
+if (Test-Path $pubspecFile) {
+    $m = Select-String -Path $pubspecFile -Pattern "^version:\s*$reSemver" | Select-Object -First 1
+    if ($m) { $pubspecVer = $m.Matches[0].Groups[1].Value }
+}
+$dartVer = $null
+if (Test-Path $dartFile) {
+    $m = Select-String -Path $dartFile -Pattern "defaultValue:\s*'$reSemver'" | Select-Object -First 1
+    if ($m) { $dartVer = $m.Matches[0].Groups[1].Value }
+}
+
+if (-not $pubspecVer -or -not $dartVer) {
+    Write-Warning "版本预检跳过：读不到 pubspec.yaml($pubspecVer) 或 app_version.dart($dartVer)"
+} else {
+    # -Version 本身得是个能比较的版本号，否则下面的判定和 flutter --build-name 都会出问题
+    $versionOk = $false
+    try { $null = [version]$Version; $versionOk = $true } catch { }
+    if (-not $versionOk) {
+        throw "-Version '$Version' 不是合法版本号（应形如 1.0.9）。"
+    }
+
+    if ($pubspecVer -ne $dartVer) {
+        Write-Warning "版本来源不同步：pubspec.yaml=$pubspecVer，app_version.dart=$dartVer —— 建议改成一致"
+    }
+
+    $isTestBuild = ([version]$Version) -lt ([version]$pubspecVer)
+
+    if (($Version -eq $pubspecVer) -and ($Version -eq $dartVer)) {
+        Write-Host "  版本预检通过：三处一致（$Version）" -ForegroundColor Green
+    } elseif ($isTestBuild) {
+        Write-Host "  版本预检：-Version $Version 低于 pubspec 的 $pubspecVer，按【本地测试包】处理" -ForegroundColor Yellow
+        Write-Host "    这种包不能用于发版（自报版本会低于标签，客户端收不到更新）" -ForegroundColor DarkGray
+    } elseif ($AllowVersionMismatch) {
+        Write-Warning "版本不一致，但已指定 -AllowVersionMismatch，继续构建"
+    } else {
+        throw (@(
+            '版本不一致，已中止构建：'
+            "    -Version            = $Version"
+            "    pubspec.yaml        = $pubspecVer"
+            "    app_version.dart    = $dartVer"
+            ''
+            "发版前请把后两处都改成 $Version（两处都要改，漏改 app_version.dart 会让自动更新静默失效）。"
+            '若只是本地试验、确定不发版，加 -AllowVersionMismatch 跳过本检查。'
+        ) -join "`n")
+    }
+}
 Write-Host ''
 
 # ---------- 1/4 内核 ----------
