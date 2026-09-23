@@ -61,6 +61,29 @@ class AppState extends ChangeNotifier {
 
   bool isRunning = false;
   bool isStarting = false;
+  /// 停止流程是否正在进行（还原系统代理 + 等端口释放都要时间）。
+  /// 这段时间两个按钮都必须禁用：启动会重复拉起内核，停止会重复 _kernelGen++
+  /// 并重复还原系统代理。
+  bool isStopping = false;
+
+  /// 启动按钮是否可点：只有「完全空闲」才可点。
+  ///
+  /// 运行中 / 启动中 / 停止中一律禁用 —— 这正是用户反馈的那条：
+  /// 停止代理还没收尾时，启动按钮不该还能点。
+  bool get canStart => !isRunning && !isStarting && !isStopping;
+
+  /// 停止按钮是否可点：**只有代理真正跑起来之后才亮**。
+  ///
+  /// 刻意**不**包含 [isStarting]（用户 2026-09-23 拍板）：启动中两个按钮都灰着，
+  /// 状态由状态灯 + 「启动中…」文案表达。「亮 = 一定能停」这个语义比「能取消慢启动」
+  /// 更重要 —— 否则按钮在「还没真正跑起来」时就高亮，用户会以为已经生效了。
+  /// 代价是启动卡住时无法取消，只能等它超时（ECH 预算 12s / TUN 等通道 60s）。
+  bool get canStop => isRunning && !isStopping;
+
+  /// 内核侧是否处于「有动静」的状态（运行 / 启动 / 停止中）。
+  /// 配置项在此时一律锁定修改 —— 尤其是停止中：内核正在退出，
+  /// 这时改配置会触发重启，和正在进行的停止流程打架。
+  bool get isBusy => isRunning || isStarting || isStopping;
   CheckState checkState = const CheckState.idle();
   bool checking = false;
   bool proxyTakenOver = false;
@@ -84,6 +107,15 @@ class AppState extends ChangeNotifier {
   PortConflict? pendingPortConflict;
   String? alertTitle;
   String? alertMessage;
+
+  /// TUN 开关点开但当前不是管理员 → home_page 弹「需要管理员权限，是否重启」。
+  /// 用户确认后走 [confirmElevation]，取消走 [cancelElevation]。
+  bool pendingElevation = false;
+
+  /// 触发提权确认的场景，决定弹窗措辞：
+  ///   'tunToggle' = 用户刚点开 TUN 开关
+  ///   'tunStart'  = 用户点了「启动代理」，而配置里 TUN 是开着的（多为开机自启）
+  String elevationReason = 'tunToggle';
 
   // ---- 更新（镜像 Mac updateInfo / updateStatus / downloadProgress）----
 
@@ -266,6 +298,41 @@ class AppState extends ChangeNotifier {
     return null;
   }
 
+  /// 用户在命名框点「取消」（主动放弃命名）时，用「未命名 N」兜底。
+  ///
+  /// 注意区分：点「确定」但名字为空**不算**放弃命名，那是输入无效，
+  /// 由 home_page 的 `_promptName` 弹提示后回到命名框让用户重填，不会走到这里。
+  ///
+  /// 为什么是兜底而不是把服务器删掉：`delete()` 在删光服务器后会立刻重建一个空名
+  /// 服务器并把 [needsNameInput] 置回 true → 命名框关掉又弹，形成死循环。
+  /// 而且应用本来就需要至少一个服务器，删掉只会让用户面对空界面。
+  ///
+  /// 名字取「未命名 + 位置序号」，与界面下拉框的 `未命名 ${i + 1}` 显示口径一致；
+  /// 若该名已被占用则顺延，避免撞上 `rename()` 的重名检查。
+  ///
+  /// 注意：不主动落盘。与 [rename] 一致——未点「保存」的草稿服务器不进 config.json。
+  void useDefaultName(ServerConfig s) {
+    if (!config.servers.contains(s)) return; // 已不在列表里（被删了），不折腾
+    final base = config.servers.indexOf(s) + 1;
+    final used = config.servers
+        .where((x) => x.id != s.id)
+        .map((x) => x.name.trim())
+        .where((n) => n.isNotEmpty)
+        .toSet();
+    var n = '未命名 $base';
+    for (var k = 1; used.contains(n); k++) {
+      n = '未命名 ${base + k}';
+    }
+    s.name = n;
+    final saved = _saved[s.id];
+    if (saved != null) {
+      saved.name = n;
+      persist();
+    }
+    _log('未命名服务器已使用默认名「$n」，可点「重命名」修改');
+    notifyListeners();
+  }
+
   void delete(String id) {
     config.servers.removeWhere((s) => s.id == id);
     _saved.remove(id);
@@ -342,15 +409,48 @@ class AppState extends ChangeNotifier {
       return;
     }
 
+    // TUN 模式前置检查。内核自己只会报一句「加载 wintun.dll 失败」或者干脆
+    // 卡在建网卡上，说不清是权限问题还是文件缺失，所以在拉起内核之前先判。
+    if (config.tunMode) {
+      if (!Elevation.isElevated) {
+        // 典型场景：开机自启起的是普通权限进程（HKCU\Run 不携带提权信息）。
+        _log('[TUN] 当前不是管理员身份运行，TUN 模式无法生效');
+        pendingElevation = true;
+        elevationReason = 'tunStart';
+        notifyListeners();
+        return;
+      }
+      if (!KernelManager.instance.wintunDllPresent()) {
+        notify('缺少 wintun.dll（TUN 模式必需）。\n请重新安装完整版本，或把 wintun.dll 放到 EChOS 安装目录。',
+            title: '启动失败');
+        return;
+      }
+    }
+
     void onLog(String line) {
       final lvl = LogLevel.classify(line);
       LogService.instance.log(line, level: lvl, uiRank: config.logLevel.rank);
     }
 
+    // ★ 在第一个 await 之前就把「启动中」置上。
+    //
+    // 以前 isStarting 只在内核进程真正被拉起时才置位（KernelManager.start 内部），
+    // AppState 又只在整个流程末尾才同步它。于是「点下按钮」到「状态变成启动中」
+    // 之间有一段空窗（端口预检最多 2 秒 + 分流数据检查），这段时间：
+    //   · 启动按钮仍是亮的、停止按钮仍是灰的 —— 用户点了没反馈，感觉「延迟/卡住」；
+    //   · 再点一次还会重复进入启动流程。
+    // 现在立刻置位，按钮马上变成「启动中」的形态。
+    isStarting = true;
+    _refreshStatusText();
+    notifyListeners();
+
     _log('正在启动内核进程…');
     final gen = ++_kernelGen;
     final startErr = await KernelManager.instance.start(s, config.routeMode,
-        log: onLog, rules: config.customRules, onExit: (code) {
+        log: onLog,
+        rules: config.customRules,
+        tun: config.tunMode,
+        onExit: (code) {
       // 旧内核的迟到回调：新内核已经顶上（或已重新走完一轮），这次退出与我们无关，
       // 忽略即可。否则会把新内核的 isRunning 打回 false、并拆掉系统代理。
       if (gen != _kernelGen) return;
@@ -367,16 +467,22 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     });
     if (startErr != null) {
+      // 失败必须清掉「启动中」，否则按钮会永远停在启动中形态。
+      isStarting = false;
+      _refreshStatusText();
       notify(startErr, title: '启动失败');
+      notifyListeners();
       return;
     }
     if (KernelManager.instance.pendingConflict != null) {
+      isStarting = false;
       pendingPortConflict = PortConflict(
         label: KernelManager.instance.pendingConflict!.label,
         port: KernelManager.instance.pendingConflict!.port,
         name: KernelManager.instance.pendingConflict!.name,
         pid: KernelManager.instance.pendingConflict!.pid,
       );
+      _refreshStatusText();
       notifyListeners();
       return;
     }
@@ -395,6 +501,8 @@ class AppState extends ChangeNotifier {
         notify('请查看运行日志', title: '启动失败');
       }
       checkState = const CheckState.failed('本地代理端口未监听，内核可能未启动成功');
+      isStarting = false;
+      _refreshStatusText();
       notifyListeners();
       return;
     }
@@ -419,7 +527,7 @@ class AppState extends ChangeNotifier {
       // 回答「这条隧道到底通不通」，不通就回滚。回滚路径是现成的 ——
       // _presentCheckResults 发现隧道失败会走 stop()，而 stop() 会自动还原系统
       // 代理，不会留下指向死端口的代理设置。
-      if (config.autoSystemProxy && !proxyTakenOver) {
+      if (config.autoSystemProxy && !proxyTakenOver && !config.tunMode) {
         await enableSystemProxy();
       }
       if (checking == false) {
@@ -442,12 +550,24 @@ class AppState extends ChangeNotifier {
     // 代号 +1：旧内核被 kill 后其 exitCode future 仍会完成并触发 onExit 回调，
     // 有了代号差就能把这次「预期内的退出」忽略掉，不会误清新内核的状态。
     _kernelGen++;
-    if (proxyTakenOver && !keepSystemProxy) await disableSystemProxy();
-    await KernelManager.instance.stop();
-    isRunning = false;
-    checkState = const CheckState.idle();
+    // ★ 标记「停止中」：还原系统代理、等内核退出、等端口真正释放都要时间。
+    // 这段窗口里两个按钮都必须禁用（canStart/canStop 都看 isStopping），
+    // 否则会重复进入 stop —— 重复 _kernelGen++、重复还原系统代理。
+    isStopping = true;
     _refreshStatusText();
     notifyListeners();
+    // try/finally：即使还原系统代理抛异常，也必须把 isStopping 清掉，
+    // 否则按钮会永久卡在「停止中」的禁用形态。
+    try {
+      if (proxyTakenOver && !keepSystemProxy) await disableSystemProxy();
+      await KernelManager.instance.stop();
+    } finally {
+      isStopping = false;
+      isRunning = false;
+      checkState = const CheckState.idle();
+      _refreshStatusText();
+      notifyListeners();
+    }
   }
 
   /// 「重启内核以应用新配置」的统一入口：切换分流模式 / 切换服务器 / 应用自定义
@@ -491,7 +611,10 @@ class AppState extends ChangeNotifier {
     // 记录「退出时代理是否在运行」，供下次启动自动恢复（对齐 Mac proxyWasRunning）
     _writeLastProxyState(wasRunning: wasRunningBeforeStop);
     if (_saved.isNotEmpty) persist();
-    LogService.instance.close();
+    // 必须 await：调用方（main.dart 的 _closeForInstall）紧接着就 exit(0)，
+    // 而内核退出前打的最后几行还在异步写队列里排着 —— 不等就整段丢，
+    // 连 `[TUN] TUN 网卡已关闭` 这种判断网卡有没有残留的唯一依据都没了。
+    await LogService.instance.close();
   }
 
   /// 崩溃/强杀自愈（对齐 Mac recoverFromUncleanExit）：
@@ -666,10 +789,121 @@ class AppState extends ChangeNotifier {
       return;
     }
     if (on) {
-      enableSystemProxy();
+      // TUN 优先级更高：TUN 开着时这一项只记配置、不接管系统代理。
+      // 关掉 TUN 后 _applyTunMode → _restartKernel → start() 会按这份配置补上接管。
+      if (config.tunMode) {
+        _log('[系统代理] TUN 模式已接管全部流量，系统代理不接管（设置已保存，关闭 TUN 后自动生效）');
+      } else {
+        enableSystemProxy();
+      }
     } else {
       disableSystemProxy();
     }
+  }
+
+  // ---- TUN 模式 ----
+
+  /// TUN 模式当前是否真的在生效（开关打开 **且** 本次是管理员身份运行）。
+  bool get tunActive => config.tunMode && isRunning && Elevation.isElevated;
+
+  /// 切换 TUN 模式。
+  ///
+  /// **TUN 优先级高于「自动设置系统代理」**：两者可同时开启，但 TUN 生效期间
+  /// 自动系统代理让位 —— 已接管的系统代理会被还原，配置本身原样保留；关掉 TUN
+  /// 后由 [_restartKernel] → [start] 按配置自动恢复接管。
+  ///
+  /// 为什么不让两者同时接管：TUN 已经把 0.0.0.0/0 全部导进内核，再设一层
+  /// 系统代理是多余的二次跳转，而且本地端口一旦出事系统代理就指向死端口，
+  /// 比不设更糟。让位而非「强制关掉开关」是为了不破坏用户的选择 ——
+  /// 以前开一次 TUN 就把 autoSystemProxy 永久置 false，用户再也找不回来。
+  ///
+  /// TUN 需要管理员权限，非管理员时**不直接改配置**，而是置 [pendingElevation]
+  /// 交给界面弹确认框 —— 用户点「重启」才落盘并提权重启，点「取消」则开关弹回。
+  void setTunMode(bool on) {
+    if (on) {
+      if (!Elevation.isElevated) {
+        _log('[TUN] 需要管理员权限，等待用户确认提权重启…');
+        pendingElevation = true;
+        elevationReason = 'tunToggle';
+        notifyListeners();
+        return;
+      }
+      if (!KernelManager.instance.wintunDllPresent()) {
+        notify('缺少 wintun.dll（TUN 模式必需）。\n请重新安装完整版本，或把 wintun.dll 放到 EChOS 安装目录。',
+            title: 'TUN 模式不可用');
+        return;
+      }
+    }
+    _applyTunMode(on);
+    notifyListeners();
+  }
+
+  /// 落盘并应用 TUN 开关（提权路径复用，见 [confirmElevation]）。
+  void _applyTunMode(bool on) {
+    config.tunMode = on;
+    // 这里**不再**把 autoSystemProxy 置 false。两者允许同时开着，TUN 只是让它
+    // 「让位」：不接管系统代理，但配置原样保留，关掉 TUN 后还能自动恢复。
+    persist();
+    if (on && proxyTakenOver) {
+      // 顺序要紧：先把系统代理还原掉，再重启内核。否则新内核起来前，系统代理
+      // 还指着旧内核的端口。
+      disableSystemProxy();
+    }
+    if (on && config.autoSystemProxy) {
+      _log('[TUN] 「自动设置系统代理」已让位 —— TUN 由虚拟网卡接管全部流量（设置保留，关闭 TUN 后自动恢复）');
+    }
+    _log('[TUN] TUN 模式已${on ? '开启' : '关闭'}');
+    if (isRunning || isStarting) {
+      _log('[TUN] 正在重启内核以应用新设置…');
+      // 关 TUN 时不必在这里补接管：_restartKernel 走 stop(keepSystemProxy: true)
+      // 不拆系统代理，随后 start() 按 autoSystemProxy && !tunMode 自然接管。
+      _restartKernel();
+    } else {
+      _refreshStatusText();
+    }
+  }
+
+  /// 用户确认提权重启。先把 TUN 落盘，重启后的新实例直接就是 TUN 模式。
+  Future<void> confirmElevation() async {
+    pendingElevation = false;
+    config.tunMode = true;
+    // 同样不动 autoSystemProxy：TUN 只是让它让位，配置保留，关 TUN 后自动恢复。
+    persist();
+    notifyListeners();
+    _log('[TUN] 正在以管理员身份重启…');
+    // ★ 记住「重启后要不要把代理跑起来」：提权后的新进程靠这个文件决定。
+    // shutdown() 里会写，但这里直接 exit(0) 不走 shutdown —— 不补这一笔，
+    // 提权一次代理就没了（用户实测反馈：重启后没有恢复代理状态）。
+    //
+    // ★★ 关键在于 `elevationReason == 'tunStart'` 这一路：
+    // 用户是**点「启动代理」**才走到提权框的 —— start() 在 TUN 未提权时会提前
+    // return，此时 isRunning / isStarting 都还是 false（代理根本没开始启动）。
+    // 若只按「当时是否在跑」记录，就会写成 stopped，重启后什么都不做，
+    // 而弹框上明明写着「重启后会自动恢复代理并继续启动」—— 承诺没兑现。
+    // 所以「因启动而提权」必须无条件记成要跑。
+    final wasRunning = isRunning || isStarting;
+    final resumeAfterRestart = elevationReason == 'tunStart' || wasRunning;
+    final err = await Elevation.relaunchElevated();
+    // 成功时 relaunchElevated 返回 null 且新实例已拉起，这里要立刻让位。
+    if (err == null) {
+      _writeLastProxyState(wasRunning: resumeAfterRestart);
+      // 让位前排空日志队列：exit(0) 会立刻结束进程，而上面这条
+      // 「正在以管理员身份重启」还在异步写队列里。提权链路出问题时
+      // 用户只能靠日志判断走到哪一步，丢了就等于盲猜。
+      await LogService.instance.flush();
+      exit(0);
+    }
+    // 被取消 / 失败：把开关弹回去，配置恢复原样
+    config.tunMode = false;
+    persist();
+    _log('[TUN] $err');
+    notify(err, title: 'TUN 模式未启用');
+  }
+
+  void cancelElevation() {
+    pendingElevation = false;
+    _log('[TUN] 已取消提权，TUN 模式未开启');
+    notifyListeners();
   }
 
   Future<void> refreshProxySummary() async {
@@ -687,6 +921,12 @@ class AppState extends ChangeNotifier {
   }
 
   void _refreshStatusText() {
+    // 停止中优先：stop() 期间 isRunning 还是 true（要等内核真正退出、端口释放），
+    // 不先判 isStopping 的话文案会一直显示「运行中」。
+    if (isStopping) {
+      statusText = '停止中…';
+      return;
+    }
     if (!isRunning) {
       statusText = isStarting ? '启动中…' : '已停止';
       return;
@@ -694,7 +934,13 @@ class AppState extends ChangeNotifier {
     var t = '运行中';
     final s = KernelManager.instance.activeSocks;
     if (s != null) t += ' · 本地端口 ${s.port}';
-    t += proxyReady ? ' · 已接管系统代理' : ' · 未接管系统代理';
+    if (config.tunMode) {
+      // TUN 模式下系统代理并没有被接管（说「已接管系统代理」会误导），
+      // 但要让人看得出：那个亮着的「自动设置系统代理」开关其实已让位。
+      t += config.autoSystemProxy ? ' · TUN 模式（系统代理已让位）' : ' · TUN 模式';
+    } else {
+      t += proxyReady ? ' · 已接管系统代理' : ' · 未接管系统代理';
+    }
     statusText = t;
   }
 
@@ -792,7 +1038,9 @@ class AppState extends ChangeNotifier {
       // 系统代理已在 start() 里端口就绪时接管过（见那里的注释），这里不再重复。
       // 兜底：万一那次没接上（比如当时 autoSystemProxy 还是关的、后来才打开），
       // 补一次，保证「代理在跑」和「系统代理已接管」最终一致。
-      if (isRunning && config.autoSystemProxy && !proxyTakenOver) {
+      // !config.tunMode 不能少：TUN 开着时系统代理必须让位，否则这里会把
+      // _applyTunMode 刚还原掉的系统代理又设回去，变成两层代理。
+      if (isRunning && config.autoSystemProxy && !proxyTakenOver && !config.tunMode) {
         _log('[系统] 自检通过，正在接管系统代理…');
         await enableSystemProxy();
       }
@@ -1009,11 +1257,13 @@ class AppState extends ChangeNotifier {
     if (inTemp) {
       final ok = await _selfReplacePortable(setupPath);
       if (!ok) throw StateError('便携版就地替换失败');
-      exit(0);
     } else {
       await _runSetupSilently(setupPath, exePath);
-      exit(0);
     }
+    // 让位前把日志排空：上面 stop() 的收尾日志（还原系统代理、内核退出）
+    // 还在异步写队列里，exit(0) 一到就全丢 —— 更新出问题时这些是唯一线索。
+    await LogService.instance.flush();
+    exit(0);
   }
 
   /// 便携版：查找用户真正双击的宿主 exe（Portable.exe）。

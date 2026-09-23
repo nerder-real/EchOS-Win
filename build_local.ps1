@@ -93,8 +93,8 @@ Write-Host ''
 # 版本号散落在三处，任一处漏改都可能让「自动更新」静默失效（自报版本 ≥ Release
 # 标签时，客户端永远判定「已是最新版本」，且不报任何错）：
 #   1. -Version          本次构建注入的版本（exe 资源 + 应用自报版本）
-#   2. pubspec.yaml      version: 1.0.9+10
-#   3. app_version.dart  defaultValue: '1.0.9'（只在没传 --dart-define 时生效）
+#   2. pubspec.yaml      version: 1.1.0+11
+#   3. app_version.dart  defaultValue: '1.1.0'（只在没传 --dart-define 时生效）
 #
 # 判定规则 —— 刻意不对「本地测试包」设卡，否则默认的 -Version 1.0.0 直接不可用：
 #   三者一致                    → 通过
@@ -122,7 +122,7 @@ if (-not $pubspecVer -or -not $dartVer) {
     $versionOk = $false
     try { $null = [version]$Version; $versionOk = $true } catch { }
     if (-not $versionOk) {
-        throw "-Version '$Version' 不是合法版本号（应形如 1.0.9）。"
+        throw "-Version '$Version' 不是合法版本号（应形如 1.1.0）。"
     }
 
     if ($pubspecVer -ne $dartVer) {
@@ -188,10 +188,10 @@ Invoke-Checked '内核编译'
 Pop-Location
 Write-Host ("  内核 {0:N1} MB" -f ((Get-Item $bundleExe).Length / 1MB)) -ForegroundColor Green
 
-# ---------- 1.5/4 分流数据 ----------
+# ---------- 1.5/4 分流数据 + wintun.dll ----------
 # 必须在 flutter build 之前：copy_bundle.cmake 是 POST_BUILD 钩子，
-# 构建时从 windows/bundle/ 把 geoip.dat / geosite.dat 拷到产物目录。
-# 仓库不携带这两个文件（.gitignore 已排除，与 CI 一样打包时下载）。
+# 构建时从 windows/bundle/ 把 geoip.dat / geosite.dat / wintun.dll 拷到产物目录。
+# 仓库不携带这三个文件（.gitignore 已排除，与 CI 一样打包时下载）。
 $bundleDir = Join-Path $root 'windows\bundle'
 New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
 foreach ($f in @('geoip.dat', 'geosite.dat')) {
@@ -201,6 +201,26 @@ foreach ($f in @('geoip.dat', 'geosite.dat')) {
         Invoke-WebRequest "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$f" -OutFile $dst
     }
 }
+
+# wintun.dll：TUN 模式的硬依赖。内核按 LOAD_LIBRARY_SEARCH_APPLICATION_DIR 加载，
+# 只认「与 x-tunnel.exe 同目录」，放别处等于没有 —— 所以必须随包发。
+# 版本刻意钉死（不跟 latest）：TUN 驱动涉及系统网卡，跨版本行为可能变，
+# 换个版本要重新验证。升级时同时改这里和 CI 工作流里的同一个常量。
+$wintunVersion = '0.14.1'
+$wintunDll = Join-Path $bundleDir 'wintun.dll'
+if (-not (Test-Path $wintunDll)) {
+    Write-Host "  下载 wintun.dll $wintunVersion ..." -ForegroundColor Gray
+    $zip = Join-Path $tmp "wintun-$wintunVersion.zip"
+    $xdir = Join-Path $tmp "wintun-$wintunVersion"
+    Invoke-WebRequest "https://www.wintun.net/builds/wintun-$wintunVersion.zip" -OutFile $zip
+    if (Test-Path $xdir) { Remove-Item -LiteralPath $xdir -Recurse -Force }
+    # 用 .NET 解压，不额外依赖 7-Zip（便携版那步才需要 7z）
+    Expand-Archive -LiteralPath $zip -DestinationPath $xdir -Force
+    $src = Join-Path $xdir 'wintun\bin\amd64\wintun.dll'
+    if (-not (Test-Path $src)) { throw "wintun 包里找不到 $src，检查下载内容" }
+    Copy-Item $src $wintunDll -Force
+}
+Write-Host ("  wintun.dll {0:N0} KB" -f ((Get-Item $wintunDll).Length / 1KB)) -ForegroundColor Green
 
 # ---------- 2/4 Flutter ----------
 Write-Host '=== 2/4 Flutter Windows Release ===' -ForegroundColor Cyan

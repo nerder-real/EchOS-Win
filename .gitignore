@@ -49,6 +49,9 @@ app.*.map.json
 /windows/bundle/*.official
 # 分流数据：打包时按命令下载，不入库（应用首次启动也会自动拉取到 %APPDATA%）
 /windows/bundle/*.dat
+# TUN 模式依赖的 Wintun 驱动 DLL：同样打包时下载，不入库
+# （内核按「与 x-tunnel.exe 同目录」加载它，所以必须落到 windows/bundle）
+/windows/bundle/*.dll
 # 内核编译产物：CI 由 setup-go 从源码构建，本地 go build 产生的 exe 不入库
 /third_party/x-tunnel/x-tunnel.exe
 *.zip

@@ -30,6 +30,36 @@ import (
 
 const defaultNIC tcpip.NICID = 1
 
+// 已启动的 TUN 设备。StartTun 结尾是 select{}（永不返回），没有任何 defer 能
+// 跑到，所以必须留一个包级引用给「优雅退出」路径去关它 —— 否则 TUN 网卡和它
+// 上面的路由/DNS 会一直留在系统里。
+var (
+	activeTun   *WindowsTun
+	activeTunMu sync.Mutex
+)
+
+func setActiveTun(t *WindowsTun) {
+	activeTunMu.Lock()
+	activeTun = t
+	activeTunMu.Unlock()
+}
+
+// stopTun 关闭 TUN 网卡。可重入、无副作用：没起过 TUN 时是空操作。
+func stopTun() {
+	activeTunMu.Lock()
+	t := activeTun
+	activeTun = nil
+	activeTunMu.Unlock()
+	if t == nil {
+		return
+	}
+	if err := t.Close(); err != nil {
+		log.Printf("[TUN] 关闭 TUN 网卡失败: %v", err)
+		return
+	}
+	log.Printf("[TUN] TUN 网卡已关闭")
+}
+
 type tunLinkEndpoint struct {
 	mtu        uint32
 	device     *WindowsTun
@@ -99,8 +129,18 @@ func (e *tunLinkEndpoint) dispatch(ctx context.Context, dispatcher stack.Network
 		}
 		data, err := e.device.ReadPacket()
 		if err != nil {
+			// 设备已关闭（正常退出路径）：直接收工。
+			// 不能像以前那样 continue —— 那样会在 ctx 还没被 cancel 的空档里
+			// 拿野句柄反复调 ReceivePacket，正是 0xc0000005 的来源。
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			if errors.Is(err, windows.ERROR_NO_MORE_ITEMS) {
-				_, _ = windows.WaitForSingleObject(e.device.ReadWaitEvent(), windows.INFINITE)
+				ev := e.device.ReadWaitEvent()
+				if ev == 0 { // 已关闭，事件句柄无效
+					return
+				}
+				_, _ = windows.WaitForSingleObject(ev, windows.INFINITE)
 				continue
 			}
 			if ctx.Err() != nil {
@@ -246,6 +286,9 @@ func StartTun(cfg *TunConfig) error {
 		tun.Close()
 		return err
 	}
+	// 登记给 stopTun（stdin EOF 的优雅退出路径）——必须在 Start 之后，
+	// 否则网卡还没配好就被关掉。
+	setActiveTun(tun)
 	log.Printf("[TUN] interface %s up", cfg.Name)
 	log.Printf("[TUN] DNS listener on TUN gateways")
 	go runDNSListener(cfg, ts.handler)
@@ -336,38 +379,55 @@ func (h *tunConnHandler) handleTCP(r *tcp.ForwarderRequest) {
 
 		// === Routing decision ===
 		if routeDecision == DecisionBlock {
-			log.Printf("[TUN][TCP][block] %s -> %s (%s)", conn.RemoteAddr(), proxyTarget, routeReason)
+			log.Printf("[TUN][TCP][block] %s -> %s (%s)", tunPeerAddr(conn), proxyTarget, routeReason)
 			return
 		}
 		if routeDecision == DecisionDirect {
 			if h.getPhysicalInterface() == nil {
-				log.Printf("[TUN][TCP][direct] %s -> %s (%s, no physical interface)", conn.RemoteAddr(), proxyTarget, routeReason)
+				log.Printf("[TUN][TCP][direct] %s -> %s (%s, no physical interface)", tunPeerAddr(conn), proxyTarget, routeReason)
 				return
 			}
 			direct, logTarget, derr := h.dialDirectTCPWithFallback(target, targetAddr, sniffedDomain, id.LocalPort)
 			if derr == nil {
-				log.Printf("[TUN][TCP][direct] %s -> %s (%s)", conn.RemoteAddr(), logTarget, routeReason)
+				log.Printf("[TUN][TCP][direct] %s -> %s (%s)", tunPeerAddr(conn), logTarget, routeReason)
 				if initial != nil {
 					direct.Write(initial)
 				}
 				directProxyStream(conn, direct)
 				return
 			}
-			log.Printf("[TUN][TCP][direct] %s -> %s (%s, direct failed: %v)", conn.RemoteAddr(), logTarget, routeReason, derr)
+			log.Printf("[TUN][TCP][direct] %s -> %s (%s, direct failed: %v)", tunPeerAddr(conn), logTarget, routeReason, derr)
 			return // 直连失败不走代理回落
 		}
 		// === Proxy outlet ===
-		stream, _, channelID, perr := h.pool.openTCPStream(proxyTarget)
+		// 用 dialViaTunnel 而不是 h.pool.openTCPStream：后者是 smux 专用，
+		// simple 协议（Worker-ECH.js）下 smux 池根本没启动，会直接报
+		// 「无可用 smux 通道」—— 现象就是 TUN 网卡建起来了、但一个包都出不去。
+		// dialViaTunnel 内部按 serverProtocol 分流（simple 走每连接新建 WS），
+		// 与本地代理（30000/30001）用的是同一条出站逻辑。
+		ob, perr := dialViaTunnel(proxyTarget)
 		if perr != nil {
-			log.Printf("[TUN][TCP][proxy] %s -> %s (%s, open failed: %v)", conn.RemoteAddr(), proxyTarget, routeReason, perr)
+			log.Printf("[TUN][TCP][proxy] %s -> %s (%s, open failed: %v)", tunPeerAddr(conn), proxyTarget, routeReason, perr)
 			return
 		}
-		log.Printf("[TUN][TCP][proxy] %s -> %s (%s, ch=%d)", conn.RemoteAddr(), proxyTarget, routeReason, channelID)
+		log.Printf("[TUN][TCP][proxy] %s -> %s (%s)", tunPeerAddr(conn), proxyTarget, routeReason)
 		if initial != nil {
-			stream.Write(initial)
+			ob.rw.Write(initial)
 		}
-		proxyConnStream(conn, stream, proxyTarget)
+		proxyConnStream(conn, ob.rw, proxyTarget)
 	}()
+}
+
+// tunPeerAddr 安全格式化 TUN 连接的远端地址。
+//
+// gonet.TCPConn.RemoteAddr() 在连接尚未完全建立、或已被关闭时会返回 nil，
+// 直接塞进 %s 会打出 `%!s(<nil>)` 这种噪音日志（真机日志里出现过，
+// 表现为 `[TUN][TCP][proxy] %!s(<nil>) -> 183.60.15.198:443`）。
+func tunPeerAddr(conn net.Conn) string {
+	if a := conn.RemoteAddr(); a != nil {
+		return a.String()
+	}
+	return "?"
 }
 
 func directFamilyFallbackAllowed(rrType uint16) bool {
@@ -592,6 +652,23 @@ func (m *udpAssocManager) onPacket(id stack.TransportEndpointID, pkt *stack.Pack
 			return true
 		}
 		useDirectAssoc = true
+	}
+
+	// ★ simple 协议（Worker-ECH.js）没有 smux 池，也没有 UDP 分帧能力，
+	// 隧道里根本传不了 UDP。以前这里是直接往下走 startAssoc → openUDPStream
+	// → 必然报「无可用 smux 通道」，然后这个关联就没了，**包被静默丢掉**，
+	// 应用只能干等到超时。
+	// 现在照搬上面 blockPorts 的做法：立刻回一个 ICMP 端口不可达，
+	// 让系统马上把对应 UDP socket 置为错误，应用随即回落 TCP
+	// （TCP 走 dialViaTunnel，simple 协议下是通的）。
+	// 注意：只影响「走代理」的 UDP；DNS(53) 和 QUIC(443/8443) 在前面已经处理掉了。
+	if !useDirectAssoc && serverProtocol.Load() == protoSimple {
+		if err := m.writeICMPPortUnreachable(src, dst); err != nil {
+			log.Printf("[TUN][UDP][proxy] %s -> %s (%s, 简易协议不支持 UDP，icmp 回写失败: %v)", src, dst, routeReason, err)
+		} else {
+			log.Printf("[TUN][UDP][proxy] %s -> %s (%s, 简易协议不支持 UDP，回 icmp port-unreachable 促其回落 TCP)", src, dst, routeReason)
+		}
+		return true
 	}
 
 	key := udpAssocKey{src: src, dst: dst}

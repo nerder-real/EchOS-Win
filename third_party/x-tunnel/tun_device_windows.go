@@ -5,6 +5,7 @@ package main
 import (
 	"crypto/md5"
 	"fmt"
+	"net"
 	"net/netip"
 	"sync"
 	"unsafe"
@@ -178,6 +179,20 @@ func (t *WindowsTun) Start() error {
 }
 
 // Close shuts down the TUN interface.
+//
+// ★ 这里必须配合下面三个方法的 t.mu 读锁使用，否则退出时会 0xc0000005。
+//
+// 坑在于 wintun.Session 的方法**全是值接收者**（`func (session Session) End()`），
+// 所以 `session.handle = 0` 只改到了栈上的副本，`t.session.handle` 依旧保留着
+// 那个已经被 WintunEndSession 释放的句柄。之后任何一次 ReceivePacket 都会把这个
+// 野句柄传进 wintun.dll → 访问违例，栈顶就是
+// `wintun.Session.ReceivePacket ← WindowsTun.ReadPacket ← tunLinkEndpoint.dispatch`。
+//
+// 时序：dispatch 协程平时阻塞在 WaitForSingleObject(ReadWaitEvent) 上，Close 一执行
+// End()，那个事件对象被关闭 → Wait 立刻返回 → 循环回头再调 ReadPacket。
+// 所以「只加一个 closed 判断」还不够，必须让 Close 与读写在锁上互斥：
+// ReceivePacket 是**非阻塞**的（没包就立刻返回 ERROR_NO_MORE_ITEMS），
+// 拿读锁包住它不会拖住 Close。
 func (t *WindowsTun) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -186,11 +201,19 @@ func (t *WindowsTun) Close() error {
 	}
 	t.closed = true
 	t.session.End()
+	// 顺手把自己这份 Session 清零（handle=0），杜绝任何绕过下面方法、
+	// 直接碰 t.session 的代码用到野句柄。
+	t.session = wintun.Session{}
 	return t.adapter.Close()
 }
 
 // ReadPacket reads one IP packet from the TUN device.
 func (t *WindowsTun) ReadPacket() ([]byte, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.closed {
+		return nil, net.ErrClosed
+	}
 	packet, err := t.session.ReceivePacket()
 	if err != nil {
 		return nil, err
@@ -203,6 +226,11 @@ func (t *WindowsTun) ReadPacket() ([]byte, error) {
 
 // WritePacket writes one IP packet to the TUN device.
 func (t *WindowsTun) WritePacket(data []byte) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.closed {
+		return net.ErrClosed
+	}
 	packet, err := t.session.AllocateSendPacket(len(data))
 	if err != nil {
 		return err
@@ -213,7 +241,16 @@ func (t *WindowsTun) WritePacket(data []byte) error {
 }
 
 // ReadWaitEvent returns the event handle for waiting on data availability.
+//
+// 已关闭时返回 0：该事件对象属于会话，End() 会把它关掉，返回旧句柄会让调用方
+// 拿一个无效句柄去 WaitForSingleObject（立刻 WAIT_FAILED，变成空转）。
+// 调用方必须把 0 当作「该退出了」。
 func (t *WindowsTun) ReadWaitEvent() windows.Handle {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.closed {
+		return 0
+	}
 	return t.session.ReadWaitEvent()
 }
 
@@ -227,17 +264,18 @@ func (t *WindowsTun) Index() (int, error) {
 }
 
 // EnsureWintunLoaded checks if wintun.dll is available.
+//
+// 注意：不能靠 `wintun.Version() != ""` 判断 —— 该函数加载失败时返回的是
+// 字符串 "unknown"（不是空串），所以原来的写法恒真，等于没检查；DLL 缺失时
+// 会一路走到 wintun.CreateAdapter，由 lazyProc.Addr() 直接 panic，用户看到的是
+// 一坨 Go 堆栈而不是「缺少 wintun.dll」。这里显式做一次 LoadLibrary 预检。
 func EnsureWintunLoaded() error {
-	ver := wintun.Version()
-	if ver != "" {
-		return nil
-	}
 	dll := windows.NewLazyDLL("wintun.dll")
 	if err := dll.Load(); err != nil {
-		return fmt.Errorf("load wintun.dll: %w", err)
+		return fmt.Errorf("加载 wintun.dll 失败：%w（该文件必须与 x-tunnel.exe 同目录）", err)
 	}
-	if ver = wintun.Version(); ver == "" {
-		return fmt.Errorf("wintun.dll loaded but version unavailable")
+	if v := wintun.Version(); v == "unknown" {
+		return fmt.Errorf("wintun.dll 已加载但读不到版本号，文件可能不完整")
 	}
 	return nil
 }

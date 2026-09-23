@@ -119,6 +119,26 @@ jobs:
           Invoke-WebRequest 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat' -OutFile "$rel/geoip.dat"
           Invoke-WebRequest 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat' -OutFile "$rel/geosite.dat"
 
+      # wintun.dll：TUN 模式的硬依赖。内核用
+      # LoadLibraryEx("wintun.dll", …, LOAD_LIBRARY_SEARCH_APPLICATION_DIR
+      # | LOAD_LIBRARY_SEARCH_SYSTEM32) 加载，只认「与 x-tunnel.exe 同目录」，
+      # 放别处等于没有 —— 所以必须随包发，否则用户打开 TUN 开关只会看到
+      # 「加载 wintun.dll 失败」。版本与 build_local.ps1 里的常量保持一致。
+      - name: 下载 wintun.dll（TUN 模式必需）
+        shell: pwsh
+        run: |
+          $rel = 'build/windows/x64/runner/Release'
+          $wintunVersion = '0.14.1'
+          $zip = "$env:TEMP\wintun.zip"
+          $xdir = "$env:TEMP\wintun"
+          Invoke-WebRequest "https://www.wintun.net/builds/wintun-$wintunVersion.zip" -OutFile $zip
+          if (Test-Path $xdir) { Remove-Item -LiteralPath $xdir -Recurse -Force }
+          Expand-Archive -LiteralPath $zip -DestinationPath $xdir -Force
+          $src = Join-Path $xdir 'wintun\bin\amd64\wintun.dll'
+          if (-not (Test-Path $src)) { Write-Error "wintun 包里找不到 $src"; exit 1 }
+          Copy-Item $src "$rel/wintun.dll" -Force
+          Write-Output ("wintun.dll {0:N0} KB" -f ((Get-Item "$rel/wintun.dll").Length / 1KB))
+
       - name: 构建安装器（Inno Setup）-> EchOS-Win-<版本>-x64-Setup.exe
         shell: pwsh
         run: |
@@ -220,7 +240,8 @@ jobs:
             Write-Output "APP_VERSION='$env:APP_VERSION' 非语义化版本，跳过版本串校验"
           }
 
-          foreach ($f in @("$rel/echos.exe", "$rel/x-tunnel.exe", "$rel/geoip.dat", "$rel/geosite.dat")) {
+          foreach ($f in @("$rel/echos.exe", "$rel/x-tunnel.exe", "$rel/wintun.dll",
+                           "$rel/geoip.dat", "$rel/geosite.dat")) {
             if (-not (Test-Path $f)) { Write-Error "缺少 $f"; exit 1 }
           }
 

@@ -9,7 +9,7 @@
 #define MyAppExeName "echos.exe"
 
 ; PE 版本资源用的四段数字版本（VS_FIXEDFILEINFO 要求 x.x.x.x）。
-; APP_VERSION 形如 v1.0.9，这里去掉前缀 v 再补一段 0 → 1.0.9.0。
+; APP_VERSION 形如 v1.1.0，这里去掉前缀 v 再补一段 0 → 1.1.0.0。
 ; 不设 VersionInfoVersion 的话 Inno 会写 0.0.0.0 —— 因为 AppVersion 带 v 前缀，
 ; 无法解析成数字，结果资源管理器「属性 → 详细信息」里文件版本是空的。
 #define MyVerBase StringChange(MyAppVersion, "v", "")

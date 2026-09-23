@@ -446,12 +446,18 @@ class ServerConfig {
   }
 
   /// 组装内核命令行参数
+  ///
+  /// [tun] = true 时追加 `-tun`，让内核建 Wintun 虚拟网卡接管全部流量。
+  /// 注意 TUN 模式下 `-l` 依然要传：内核会照常在启动 TUN 之前把本地
+  /// SOCKS5/HTTP 监听拉起来（见 x-tunnel.go 的 TUN 分支），只是应用不再去
+  /// 接管系统代理。
   List<String> arguments(
       {String? listen,
       String? geoip,
       String? geosite,
       required RouteMode mode,
-      List<CustomRule>? rules}) {
+      List<CustomRule>? rules,
+      bool tun = false}) {
     final args = <String>[];
     void add(String flag, String value) {
       final v = value.trim();
@@ -462,6 +468,7 @@ class ServerConfig {
 
     add('-f', normalizedServer);
     add('-l', listen ?? expandedListen);
+    if (tun) args.add('-tun');
 
     // 全局规则：所有服务器共用
     final custom = (rules ?? customRules).map((r) {
@@ -540,6 +547,21 @@ class AppConfig {
   List<ServerConfig> servers;
   String? selectedID;
   bool autoSystemProxy;
+  /// 启用 TUN 模式：内核建一块 Wintun 虚拟网卡接管全部流量，不再依赖系统代理。
+  ///
+  /// **优先级高于 [autoSystemProxy]**：两者可以同时开着，但 TUN 生效期间
+  /// [autoSystemProxy] 自动让位 —— 不接管系统代理（已接管的会还原），配置本身
+  /// 原样保留，关掉 TUN 后自动恢复接管。
+  ///
+  /// 为什么不让两者同时接管：TUN 已经把 0.0.0.0/0 全部导进内核，再设一层系统
+  /// 代理是多余的二次跳转；而且一旦本地端口出事，系统代理会指向死端口，比不设更糟。
+  ///
+  /// 为什么是「让位」而不是「强制关掉开关」：以前开一次 TUN 就会把
+  /// [autoSystemProxy] 永久置 false 且不恢复，用户下次想用系统代理时发现开关
+  /// 莫名其妙关了，还找不回来。让位只影响「这一刻接管不接管」，不动用户的选择。
+  ///
+  /// 需要管理员权限（建虚拟网卡 + 改路由表 + 改网卡 DNS），见 platform_drivers.dart。
+  bool tunMode;
   bool showDiagnosticLogs;
   LogLevel logLevel;
   bool showDockIcon;
@@ -553,6 +575,7 @@ class AppConfig {
     List<ServerConfig>? servers,
     this.selectedID,
     this.autoSystemProxy = true,
+    this.tunMode = false,
     this.showDiagnosticLogs = false,
     this.logLevel = LogLevel.info,
     this.showDockIcon = false,
@@ -588,6 +611,7 @@ class AppConfig {
       servers: servers,
       selectedID: j['selectedID'] as String?,
       autoSystemProxy: (j['autoSystemProxy'] as bool?) ?? true,
+      tunMode: (j['tunMode'] as bool?) ?? false,
       showDiagnosticLogs: (j['showDiagnosticLogs'] as bool?) ?? false,
       logLevel: LogLevel.fromRaw(j['logLevel'] as String?),
       showDockIcon: (j['showDockIcon'] as bool?) ?? false,
@@ -610,6 +634,7 @@ class AppConfig {
             }).toList(),
         'selectedID': selectedID,
         'autoSystemProxy': autoSystemProxy,
+        'tunMode': tunMode,
         'showDiagnosticLogs': showDiagnosticLogs,
         'logLevel': logLevel.raw,
         'showDockIcon': showDockIcon,

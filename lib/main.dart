@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:io';
 
@@ -9,6 +8,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'services/app_paths.dart';
 import 'services/app_state.dart';
+import 'services/instance_guard.dart';
 import 'services/kernel_manager.dart';
 import 'services/system_proxy.dart';
 import 'services/tray_service.dart';
@@ -33,93 +33,8 @@ class _KeepCentered with WindowListener {
   }
 }
 
-/// 单实例锁 + 二次启动唤起的 IPC 端口（仅回环，防火墙不感知）。
-/// 首次运行：监听该端口；此后双击桌面图标/再运行启动程序，
-/// 新实例发现已有存活进程 → 连上端口让旧实例 show()+focus() 主窗口，然后自己退出。
-const int _ipcPort = 45871;
-
-/// 已有实例在跑时：让它把主窗口带到前台，本进程随后退出。
-/// 返回 true 表示「本实例应退出」。
-///
-/// 判据必须是「锁里的 PID 确实属于本程序」，不能只看 PID 存活着：
-/// **PID 会被系统复用**。旧实现只调 tasklist 按 PID 过滤，锁里残留的旧 PID
-/// 一旦被别的进程占用（实测撞上 msedge.exe），就会被误判成「已有实例在跑」，
-/// 于是唤起失败也照样退出 —— 表现为「双击图标完全没反应，应用起不来」，
-/// 且会一直持续到 PID 再次变化。现在核对映像名，不匹配就接管锁。
-Future<bool> _wakeExistingInstance() async {
-  try {
-    final dir = Directory(AppPaths.appDataDir.path)
-      ..createSync(recursive: true);
-    final lock = File('${dir.path}${Platform.pathSeparator}instance.lock');
-    if (lock.existsSync()) {
-      final ownerPid = int.tryParse(lock.readAsStringSync().trim());
-      // ownerPid == pid 只在极端复用下出现，一并排除避免自己把自己挡住。
-      if (ownerPid != null && ownerPid != pid && _isOwnProcess(ownerPid)) {
-        await _tryWake();
-        return true;
-      }
-    }
-    // 无锁 / 解析失败 / 该 PID 不是本程序 → 视为陈旧锁，接管
-    lock.writeAsStringSync('$pid');
-  } catch (_) {
-    // 锁文件异常不影响启动
-  }
-  return false;
-}
-
-/// 连接运行中的实例，请求显示主窗口；成功返回 true。
-Future<bool> _tryWake() async {
-  try {
-    final socket = await Socket.connect('127.0.0.1', _ipcPort,
-        timeout: const Duration(milliseconds: 1500));
-    socket.add(utf8.encode('show'));
-    await socket.flush();
-    await socket.first; // 等旧实例应答，确保窗口已拉起再退
-    socket.destroy();
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-/// 首个实例常驻监听：新实例唤起 → 显示主窗口并聚焦。
-Future<void> _listenForWake() async {
-  try {
-    final server = await ServerSocket.bind('127.0.0.1', _ipcPort);
-    server.listen((socket) async {
-      try {
-        await socket.first;
-        await windowManager.show();
-        await windowManager.focus();
-        socket.write('ok');
-        await socket.flush();
-      } catch (_) {}
-      socket.destroy();
-    });
-  } catch (_) {
-    // 端口被其他程序占用时仅影响「二次启动唤起」，应用功能不受影响
-  }
-}
-
-/// 判断 pid 对应的进程是不是本程序的可执行文件。
-///
-/// tasklist 的 `/fi "PID eq N"` 只按 PID 过滤，不告诉你是哪个程序；
-/// 必须再用 `/fo csv` 取映像名比对，否则 PID 复用会让陈旧锁把应用锁死。
-bool _isOwnProcess(int p) {
-  try {
-    final selfName = Platform.resolvedExecutable
-        .split(Platform.pathSeparator)
-        .last
-        .toLowerCase();
-    if (selfName.isEmpty) return false;
-    final r = Process.runSync(
-        'tasklist', ['/fi', 'PID eq $p', '/fo', 'csv', '/nh']);
-    return r.stdout.toString().toLowerCase().contains(selfName);
-  } catch (_) {
-    return false;
-  }
-}
-
+/// 单实例锁 + 二次启动唤起的 IPC 端口已抽到 services/instance_guard.dart ——
+/// 「以管理员身份重启」需要在交接窗口里主动放开它们，见该文件顶部说明。
 
 /// 监听安装器授权标记，收到后自动退出应用。
 ///
@@ -205,11 +120,16 @@ void _acquireInstallMutex() {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // 已有实例：唤起其窗口后必须显式退出进程（Flutter 桌面端 main() return 不结束进程）
-  if (await _wakeExistingInstance()) exit(0);
+  if (await InstanceGuard.claimOrWake()) exit(0);
   _acquireInstallMutex(); // Inno AppMutex 探测用，仅首次存活实例持有
   _watchForInstaller();   // 监听安装器授权标记，收到后自动安全退出
   await windowManager.ensureInitialized();
-  _listenForWake(); // fire-and-forget：此后双击图标/再启动即唤起主窗口
+  // fire-and-forget：此后双击图标/再启动即唤起主窗口。
+  // 回调里用 windowManager 显示窗口，避免 InstanceGuard 依赖 window_manager。
+  InstanceGuard.startWakeListener(() async {
+    await windowManager.show();
+    await windowManager.focus();
+  });
   const opts = WindowOptions(
     size: Size(796, 900),
     minimumSize: Size(796, 400),

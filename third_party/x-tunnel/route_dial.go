@@ -39,9 +39,14 @@ func initLocalRouting() {
 	log.Printf("[分流] 规则模式已就绪")
 }
 
-// outbound 是一条出站连接：可能是隧道里的 smux 流，也可能是本地直连的 TCP。
+// outbound 是一条出站连接：可能是隧道里的流（smux 池 或 simple WS），
+// 也可能是本地直连的 TCP。
+//
+// rw 用 net.Conn 而不是 io.ReadWriteCloser：TUN 的 DoH 出站要把它交给
+// tls.Client，而 tls 需要 net.Conn（要 SetDeadline）。simpleWSConn 和
+// smux.Stream 都实现了完整的 net.Conn，直连的 net.Conn 更不必说。
 type outbound struct {
-	rw        io.ReadWriteCloser
+	rw        net.Conn
 	channelID int
 	direct    bool
 }

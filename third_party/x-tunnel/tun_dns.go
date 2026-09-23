@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -43,6 +44,7 @@ type DNSHandler struct {
 	dohMu           sync.Mutex
 	dohClientCache  *http.Client
 	dohDisableUntil time.Time // 长连接确认异常后的冷静期截止时刻
+	dohEPIdx        atomic.Int32 // 当前生效的 dohEndpoints 下标（成功过就记住）
 }
 
 var dnsHandlerInstance *DNSHandler
@@ -358,11 +360,43 @@ func getSystemDNSServers(iface *net.Interface) []string {
 	return result
 }
 
-const (
-	dohURL        = "https://cloudflare-dns.com/dns-query"
-	dohHost       = "cloudflare-dns.com:443"
-	dohServerName = "cloudflare-dns.com"
+// DoH 端点候选，按顺序尝试，成功过的那个会被记住（sticky）。
+//
+// ★ dns.google 必须排在第一位，原因是 Cloudflare 官方文档明确写了
+// 「Outbound TCP sockets to Cloudflare IP ranges are blocked.」
+// （developers.cloudflare.com/workers/runtime-apis/tcp-sockets 的
+// Considerations / Troubleshooting：不允许的地址包括 Cloudflare IPs、
+// localhost、内网 IP，报错 `cannot connect to the specified address`）。
+//
+// 而本项目实际部署的服务端就是 Cloudflare Worker（worker/Worker-ECH.js，
+// 用的是 `connect()` 而不是 `fetch()`，所以这条封锁确实生效），
+// `cloudflare-dns.com` 恰好解析到 CF 自家网段（104.16.248.249 等）。
+//
+// Worker 侧虽然有兜底：`CF_FALLBACK_IPS = ['ProxyIP.CMLiussss.net']`，
+// connect 撞到 CF 错误时会改用这个社区维护的反代 IP，靠客户端 TLS SNI
+// 转发到真实目标 —— 也就是说 cloudflare-dns.com 最终**能通**，但代价是：
+//   1. 每次建连都要先失败一次（Worker 的 connect 超时给到 6 秒）；
+//   2. 还要再绕一层社区维护的中转，那个域名失效是常态；
+//   3. 客户端侧 dialViaTunnel 的快速失败阈值只有 700ms，
+//      这一来一回很容易超阈值 → 白跑 3 次 WS 握手才成功。
+//
+// dns.google 是非 CF 网段，Worker 可以直连，无需中转、一次握手即成。
+// 把它放在后面只作为兜底：万一某个服务端的出口访问不了 Google，
+// 还能落回 Cloudflare（自建 x-tunnel/smux 服务端就是自己的 Go 进程，
+// 连 CF 毫无限制，直接可用）。
+var dohEndpoints = []dohEndpoint{
+	{name: "dns.google", host: "dns.google:443", sni: "dns.google", url: "https://dns.google/dns-query"},
+	{name: "cloudflare-dns.com", host: "cloudflare-dns.com:443", sni: "cloudflare-dns.com", url: "https://cloudflare-dns.com/dns-query"},
+}
 
+type dohEndpoint struct {
+	name string // 预热用的查询域名
+	host string // 隧道 CONNECT 的目标
+	sni  string // TLS SNI / Host
+	url  string // DoH POST 地址
+}
+
+const (
 	// 单次解析的总预算。改造前每条查询是 SetDeadline(5s) 的硬上限，这里必须
 	// 保持同量级：长连接一旦半开（对端单方面断开、WebSocket 重连后 smux 会话
 	// 失效等），请求会一直挂到超时，预算过大就会把所有域名解析拖成十几秒，
@@ -392,25 +426,36 @@ func (d *DNSHandler) dohClient() *http.Client {
 	if d.pool == nil {
 		return nil
 	}
-	pool := d.pool
 	d.dohClientCache = &http.Client{
 		Transport: &http.Transport{
 			Proxy: nil,
-			// 自定义拨号：在隧道的 smux 流上完成 TLS，连接交由上层复用
+			// 自定义拨号：在隧道流上完成 TLS，连接交由上层复用。
+			// 必须用 dialViaTunnel 而不是 pool.openTCPStream —— 后者是 smux 专用，
+			// simple 协议（Worker-ECH.js）下必然失败，表现是 DNS 全部 SERVFAIL，
+			// TUN 模式下等于断网。
+			//
+			// ★ 拨号目标用传进来的 addr（来自请求 URL 的 host:port），
+			// 不再写死某一个 DoH 主机 —— 这样同一个 client 就能服务
+			// dohEndpoints 里的任意端点（Transport 按 host 分别维护连接池），
+			// 端点切换时也不需要重建 client。
 			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				s, _, _, err := pool.openTCPStream(dohHost)
+				sni, _, err := net.SplitHostPort(addr)
+				if err != nil || sni == "" {
+					sni = addr
+				}
+				ob, err := dialViaTunnel(addr)
 				if err != nil {
 					return nil, err
 				}
-				tc := tls.Client(s, &tls.Config{
-					ServerName: dohServerName,
+				tc := tls.Client(ob.rw, &tls.Config{
+					ServerName: sni,
 					MinVersion: tls.VersionTLS12,
 					// 使用自定义 DialTLSContext 时 transport 不会代劳，
 					// 必须自己声明 h2，否则永远协商不到 HTTP/2。
 					NextProtos: []string{"h2", "http/1.1"},
 				})
 				if err := tc.HandshakeContext(ctx); err != nil {
-					s.Close()
+					ob.rw.Close()
 					return nil, err
 				}
 				return tc, nil
@@ -452,34 +497,69 @@ func (d *DNSHandler) markDohBroken() {
 	d.dohMu.Unlock()
 }
 
+// currentDoH 返回当前生效的 DoH 端点。
+func (d *DNSHandler) currentDoH() dohEndpoint {
+	idx := int(d.dohEPIdx.Load())
+	if idx < 0 || idx >= len(dohEndpoints) {
+		idx = 0
+	}
+	return dohEndpoints[idx]
+}
+
 // warmupDoH 在 TUN 启动后提前把 DoH 连接建好，避免首个域名解析付一次冷启动。
 // 预热失败不进冷静期（此时隧道可能还没就绪，属正常现象）。
 func (d *DNSHandler) warmupDoH() {
-	q := buildDNSQuery(dohServerName, dnsTypeA)
+	ep := d.currentDoH()
+	q := buildDNSQuery(ep.name, dnsTypeA)
 	if len(q) == 0 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dohQueryTimeout)
 	defer cancel()
-	if _, err := d.dohViaPersistent(ctx, q); err == nil {
-		log.Printf("[DNS] DoH 长连接预热完成")
+	if _, err := d.dohViaPersistent(ctx, q, ep); err == nil {
+		log.Printf("[DNS] DoH 长连接预热完成（%s）", ep.name)
 	} else {
 		d.resetDohClient()
 	}
 }
 
-// resolveRemote resolves DNS via tunnel DoH to cloudflare-dns.com
+// resolveRemote resolves DNS via tunnel DoH.
+//
+// 依次尝试 dohEndpoints 里的端点，任一成功即返回，并把它记为当前端点
+// （下次直接用，不再逐个试）。之所以要逐个试：本项目实际部署的服务端是
+// Cloudflare Worker，而 Workers 的 connect() 禁止连 CF 自家网段，
+// `cloudflare-dns.com` 必然失败（见 dohEndpoints 上方注释）。
 func (d *DNSHandler) resolveRemote(q []byte) []byte {
 	if d.pool == nil {
 		return nil
 	}
+	start := int(d.dohEPIdx.Load())
+	if start < 0 || start >= len(dohEndpoints) {
+		start = 0
+	}
+	for i := 0; i < len(dohEndpoints); i++ {
+		idx := (start + i) % len(dohEndpoints)
+		ep := dohEndpoints[idx]
+		if body := d.resolveRemoteVia(q, ep); body != nil {
+			if idx != start {
+				d.dohEPIdx.Store(int32(idx))
+				log.Printf("[DNS] DoH 端点切换到 %s", ep.name)
+			}
+			return body
+		}
+	}
+	return nil
+}
+
+// resolveRemoteVia 用指定端点完成一次解析：先长连接，超时/失败再一次性连接。
+func (d *DNSHandler) resolveRemoteVia(q []byte, ep dohEndpoint) []byte {
 	ctx, cancel := context.WithTimeout(context.Background(), dohQueryTimeout)
 	defer cancel()
 
 	// 优先走长连接，但它只拿到总预算的一部分，超时立刻放弃换兜底路径
 	if d.dohPersistentAllowed() {
 		pctx, pcancel := context.WithTimeout(ctx, dohPersistentTimeout)
-		body, err := d.dohViaPersistent(pctx, q)
+		body, err := d.dohViaPersistent(pctx, q, ep)
 		pcancel()
 		if err == nil {
 			return body
@@ -497,16 +577,16 @@ func (d *DNSHandler) resolveRemote(q []byte) []byte {
 	if ctx.Err() != nil {
 		return nil
 	}
-	return d.dohSingleShot(ctx, q)
+	return d.dohSingleShot(ctx, q, ep)
 }
 
 // dohViaPersistent 复用长连接完成一次 DoH 查询。ctx 由调用方限定。
-func (d *DNSHandler) dohViaPersistent(ctx context.Context, q []byte) ([]byte, error) {
+func (d *DNSHandler) dohViaPersistent(ctx context.Context, q []byte, ep dohEndpoint) ([]byte, error) {
 	client := d.dohClient()
 	if client == nil {
 		return nil, errors.New("隧道未就绪")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dohURL, bytes.NewReader(q))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.url, bytes.NewReader(q))
 	if err != nil {
 		return nil, err
 	}
@@ -525,13 +605,14 @@ func (d *DNSHandler) dohViaPersistent(ctx context.Context, q []byte) ([]byte, er
 }
 
 // dohSingleShot 兜底路径，行为与改造前一致：新建一条流完成一次查询后立即关闭。
-func (d *DNSHandler) dohSingleShot(ctx context.Context, q []byte) []byte {
-	s, _, _, err := d.pool.openTCPStream(dohHost)
+// 同样走 dialViaTunnel —— simple 协议下没有 smux 池，直连 openTCPStream 必然失败。
+func (d *DNSHandler) dohSingleShot(ctx context.Context, q []byte, ep dohEndpoint) []byte {
+	ob, err := dialViaTunnel(ep.host)
 	if err != nil {
 		return nil
 	}
-	defer s.Close()
-	tc := tls.Client(s, &tls.Config{ServerName: dohServerName, MinVersion: tls.VersionTLS12})
+	defer ob.rw.Close()
+	tc := tls.Client(ob.rw, &tls.Config{ServerName: ep.sni, MinVersion: tls.VersionTLS12})
 	if dl, ok := ctx.Deadline(); ok {
 		tc.SetDeadline(dl)
 	} else {
@@ -541,14 +622,14 @@ func (d *DNSHandler) dohSingleShot(ctx context.Context, q []byte) []byte {
 		return nil
 	}
 	defer tc.Close()
-	req, err := http.NewRequest(http.MethodPost, dohURL, bytes.NewReader(q))
+	req, err := http.NewRequest(http.MethodPost, ep.url, bytes.NewReader(q))
 	if err != nil {
 		return nil
 	}
 	req.ContentLength = int64(len(q))
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
-	req.Host = dohServerName
+	req.Host = ep.sni
 	req.Close = true
 	if err := req.Write(tc); err != nil {
 		return nil

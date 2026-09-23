@@ -125,6 +125,42 @@ class _HomePageState extends State<HomePage> with WindowListener {
       );
 return;
     }
+    // TUN 模式需要管理员权限：开关点开、或启动时发现 TUN 已开启但不是管理员
+    // （典型是开机自启起的普通权限进程）→ 询问是否提权重启。
+    if (app.pendingElevation) {
+      _alertShowing = true;
+      final fromStart = app.elevationReason == 'tunStart';
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (c) => EchDialog(
+          title: 'TUN 模式需要管理员权限',
+          message: fromStart
+              ? '当前不是以管理员身份运行，TUN 模式无法生效。\n\n'
+                  'Windows 不允许运行中的程序提升权限，所以要以管理员身份重启。\n'
+                  '重启后会自动恢复代理并继续启动。'
+              : 'TUN 模式要创建虚拟网卡、修改路由表和网卡 DNS，需要管理员权限。\n\n'
+                  'Windows 不允许运行中的程序提升权限，所以要以管理员身份重启 EchOS。\n'
+                  '重启后会自动恢复代理，TUN 模式立即生效。',
+          actions: [
+            EchDialog.cancel(c, onPressed: () {
+              Navigator.pop(c);
+              app.cancelElevation();
+              _alertShowing = false;
+              _maybeShowAlerts();
+            }),
+            EchDialog.confirm(c,
+                label: '以管理员身份重启',
+                onPressed: () {
+                  Navigator.pop(c);
+                  _alertShowing = false;
+                  app.confirmElevation();
+                }),
+          ],
+        ),
+      );
+      return;
+    }
     final pending = app.pendingUpdate;
     if (pending != null) {
       // 发现新版本 → 与 Mac 一致：图标 + 版本 + 「下载并更新」确认框
@@ -586,54 +622,91 @@ class _ServerGroup extends StatelessWidget {
 Future<void> _promptName(BuildContext context, AppState app, ServerConfig s,
     {bool rename = false}) async {
   final controller = TextEditingController(text: rename ? s.name : '');
-  final name = await showDialog<String>(
-    context: context,
-    builder: (c) => EchDialog(
-      title: rename ? '重命名服务器' : '新建服务器名称',
-      message: '服务器名称最多支持 8 个汉字 / 16 个英文数字符号',
-      content: TextField(
-        controller: controller,
-        autofocus: true,
-        style: TextStyle(
-            fontSize: EchTheme.fsBody,
-            fontWeight: EchTheme.fwContent,
-            color: EchTheme.inputText(Theme.of(context))),
-        decoration: InputDecoration(
-          hintText: '例如：xx服务器',
-          isDense: true,
-          filled: true,
-          fillColor: EchTheme.inputBg(Theme.of(c)),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(9),
-            borderSide: BorderSide.none,
+
+  // 命名框可能因为输入无效被反复弹回，所以整段放进循环：
+  //   取消     → 跳出循环，走「默认名兜底 / 保持原名」
+  //   名字无效 → 弹提示，然后回到命名框让用户重填
+  //   名字有效 → 落名后直接返回
+  //
+  // 关键：「确定但空名」和「取消」是两回事，不能合并处理 ——
+  //   取消       = 用户主动放弃命名 → 替他兜个默认名
+  //   确定但空名 = 输入无效         → 应该让他重填，而不是替他起名
+  // 早先把两者都并进「默认名兜底」，等于把「确定」变成了「取消」。
+  while (true) {
+    final input = await showDialog<String>(
+      context: context,
+      builder: (c) => EchDialog(
+        title: rename ? '重命名服务器' : '新建服务器名称',
+        message: '服务器名称最多支持 8 个汉字 / 16 个英文数字符号',
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          style: TextStyle(
+              fontSize: EchTheme.fsBody,
+              fontWeight: EchTheme.fwContent,
+              color: EchTheme.inputText(Theme.of(context))),
+          decoration: InputDecoration(
+            hintText: '例如：xx服务器',
+            isDense: true,
+            filled: true,
+            fillColor: EchTheme.inputBg(Theme.of(c)),
+            enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(9),
+              borderSide: BorderSide.none,
+            ),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(9),
+              borderSide:
+                  const BorderSide(color: Color(0xFF0A84FF), width: 1.3),
+            ),
           ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(9),
-            borderSide:
-                const BorderSide(color: Color(0xFF0A84FF), width: 1.3),
-          ),
+          onSubmitted: (v) => Navigator.pop(c, v),
         ),
-        onSubmitted: (v) => Navigator.pop(c, v),
+        actions: [
+          EchDialog.cancel(c, onPressed: () => Navigator.pop(c)),
+          EchDialog.confirm(c,
+              label: '确定',
+              onPressed: () => Navigator.pop(c, controller.text.trim())),
+        ],
       ),
-      actions: [
-        EchDialog.cancel(c, onPressed: () => Navigator.pop(c)),
-        EchDialog.confirm(c,
-            label: '确定',
-            onPressed: () => Navigator.pop(c, controller.text.trim())),
-      ],
-    ),
-  );
+    );
+
+    if (input == null) break; // 取消
+    // rename() 只在校验全通过之后才改状态，失败时原样返回错误文案，可反复调用
+    final err = app.rename(input);
+    if (err == null) {
+      controller.dispose();
+      return;
+    }
+    if (!context.mounted) {
+      controller.dispose();
+      return;
+    }
+    // 名字不能用（空 / 太长 / 重名）→ 提示后回到命名框重填
+    await showDialog<void>(
+      context: context,
+      builder: (c) => EchDialog(
+        title: '无法使用这个名字',
+        message: err,
+        actions: [
+          EchDialog.confirm(c, label: '好', onPressed: () => Navigator.pop(c)),
+        ],
+      ),
+    );
+    if (!context.mounted) {
+      controller.dispose();
+      return;
+    }
+  }
+
   controller.dispose();
-  if (name == null) {
-    if (!rename && s.name.isEmpty) app.delete(s.id);
-    return;
-  }
-  final err = app.rename(name);
-  if (err != null) {
-    app.alertTitle = '无法使用这个名字';
-    app.alertMessage = err;
-    app.refresh();
-  }
+  // 取消 = 放弃命名，用「未命名 N」兜底。
+  //
+  // 这里千万不能走 app.delete()：delete() 在把服务器删光后会立刻重建一个空名
+  // 服务器、并把 needsNameInput 置回 true，于是「点取消 → 弹窗关掉又马上重开」，
+  // 命名框永远关不掉（实测复现：连点取消，弹窗一直在）。
+  // 改名场景取消 = 保持原名，什么都不做。
+  if (!rename) app.useDefaultName(s);
 }
 
 Future<void> _confirmDelete(
@@ -667,7 +740,7 @@ class _CoreGroup extends StatelessWidget {
   Widget build(BuildContext context) {
     final app = AppState.instance;
     final s = app.selected;
-    final locked = app.isRunning || app.isStarting; // 运行中锁定配置修改
+    final locked = app.isBusy; // 运行/启动/停止中锁定配置修改
     return _GroupCard(
       title: '核心配置',
       icon: Icons.settings_rounded,
@@ -853,7 +926,7 @@ class _AdvancedGroup extends StatelessWidget {
   Widget build(BuildContext context) {
     final app = AppState.instance;
     final s = app.selected;
-    final locked = app.isRunning || app.isStarting; // 运行中锁定配置修改
+    final locked = app.isBusy; // 运行/启动/停止中锁定配置修改
     return _GroupCard(
       title: '高级选项',
       icon: Icons.tune_rounded,
@@ -1335,18 +1408,36 @@ class _BottomBlock extends StatelessWidget {
                 onChanged: (v) => app.setLaunchAtLogin(v),
               ),
             const SizedBox(width: 18),
+            // 这一项在 TUN 开启时不再置灰：两者允许同时开着，TUN 优先级更高 ——
+            // 生效期间自动系统代理只是「让位」（不接管系统代理），配置原样保留，
+            // 关掉 TUN 后自动恢复接管。状态栏会标注「系统代理已让位」。
             _ModernCheck(
               value: app.config.autoSystemProxy,
               label: '自动设置系统代理',
               onChanged: (v) => app.setAutoSystemProxy(v),
             ),
+            const SizedBox(width: 18),
+            // 位置：放在「自动设置系统代理」之后而不是两者中间 ——
+            // 两种放法下「系统代理 / TUN」本来就是相邻的，分组效果一样；
+            // 区别只在谁在前。系统代理默认开启、零门槛、是主路径，TUN 需要
+            // 管理员权限且会建虚拟网卡，属于进阶选项，按「常用 → 进阶」排；
+            // 顺带也不动老用户对第 2 项位置的肌肉记忆。
+            _ModernCheck(
+              value: app.config.tunMode,
+              label: '启用 TUN 模式',
+              onChanged: (v) => app.setTunMode(v),
+            ),
             const Spacer(),
+            // 按钮可用性统一走 AppState.canStart / canStop：
+            //   启动 —— 只有完全空闲（未运行、未启动中、未停止中）才可点；
+            //   停止 —— 只在代理真正跑起来后可点；启动中/停止中都灰着。
+            // 启动中的状态由左侧状态灯（黄）+「启动中…」文案表达，不靠按钮高亮。
             AppButton('启动代理',
                 gradient: EchTheme.blueGradient(),
                 minWidth: 120,
                 height: 36,
                 fontSize: EchTheme.fsAction,
-                enabled: !app.isRunning && !app.isStarting,
+                enabled: app.canStart,
                 onPressed: app.start),
             const SizedBox(width: 8),
             AppButton('停止代理',
@@ -1354,7 +1445,7 @@ class _BottomBlock extends StatelessWidget {
                 minWidth: 120,
                 height: 36,
                 fontSize: EchTheme.fsAction,
-                enabled: app.isRunning || app.isStarting,
+                enabled: app.canStop,
                 onPressed: () => app.stop()),
           ]),
           const SizedBox(height: 10),
@@ -1435,6 +1526,7 @@ class _BottomBlock extends StatelessWidget {
   Color _statusColor(BuildContext context, AppState app) {
     // 对齐 Mac statusDotColor：先看运行状态，未运行一律橙（即使自检通过过）；
     // 运行中才用自检结果着色。
+    if (app.isStopping) return EchTheme.cloud; // 停止中：灰，和「已停止」同色系
     if (app.isStarting) return EchTheme.yellow;
     if (!app.isRunning) return EchTheme.cloud;
     switch (app.checkState.kind) {
@@ -1450,6 +1542,7 @@ class _BottomBlock extends StatelessWidget {
   }
 
   String _checkLabel(AppState app) {
+    if (app.isStopping) return '· 停止中…';
     if (app.isStarting) return '· 启动中…';
     switch (app.checkState.kind) {
       case CheckStateKind.running:
@@ -1597,6 +1690,8 @@ class _ModernCheck extends StatelessWidget {
   final bool value;
   final String label;
   final ValueChanged<bool> onChanged;
+  // 曾经有过 enabled 参数（TUN 开启时把「自动设置系统代理」置灰）。
+  // 改成「可共存、TUN 优先让位」后不再需要置灰，已移除。
   const _ModernCheck(
       {required this.value, required this.label, required this.onChanged});
 

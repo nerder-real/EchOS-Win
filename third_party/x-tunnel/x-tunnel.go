@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -139,6 +140,11 @@ var (
 	echList   []byte
 	refreshMu sync.Mutex
 
+	// echUnavailable 表示「本次运行已放弃 ECH，降级为普通 TLS 1.3」。
+	// prepareECH 重试超限后置位；getECHList / buildUnifiedTLSConfig 据此改走
+	// 标准 TLS 路径。后续某次刷新成功取到配置时会重新清零。
+	echUnavailable atomic.Bool
+
 	echPool *ECHPool
 
 	clientID      string
@@ -179,8 +185,38 @@ func init() {
 	flag.StringVar(&ips, "ips", "", "IP 访问策略（TUN 默认双栈；域名出口按该策略解析）\n 4: 仅IPv4\n 6: 仅IPv6\n 4,6: 域名由服务端解析时 IPv4优先\n 6,4: 域名由服务端解析时 IPv6优先")
 }
 
+// watchParentForExit 阻塞读 stdin，读到 EOF 就清理资源并退出。
+//
+// 触发条件有两种，都是我们要的：父进程主动关闭管道（正常停内核），或父进程
+// 已经消失（管道写端随进程退出而关闭，内核不会变成孤儿）。
+// 读出错时只记日志、不退出 —— 宁可让父进程走超时强杀，也别因为一次读错误
+// 把正在工作的内核干掉。
+func watchParentForExit() {
+	if _, err := io.Copy(io.Discard, os.Stdin); err != nil {
+		log.Printf("[系统] 读取标准输入出错（%v），不触发退出", err)
+		return
+	}
+	log.Printf("[系统] 标准输入已关闭（父进程要求退出），正在清理资源…")
+	stopTun()
+	log.Printf("[系统] 清理完成，退出")
+	os.Exit(0)
+}
+
 func main() {
 	flag.Parse()
+
+	// 优雅退出通道：父进程（EchOS）停内核时先关闭本进程的 stdin，
+	// 这里读到 EOF 就清理资源再退出。
+	//
+	// 为什么不用信号：Windows 上 Dart 的 Process.kill 走的是 TerminateProcess，
+	// 进程内收不到任何通知，os/signal 也拿不到 SIGTERM。直接被杀的话 TUN 网卡、
+	// 网卡上的路由和 DNS 全都留在系统里（轻则网卡列表多一个「xtun」，重则路由
+	// 指着已经死掉的网卡）。顺带还有个好处：父进程崩溃/被强杀时管道随之关闭，
+	// 内核也能自己收尾退出，不会变成孤儿进程。
+	//
+	// 必须放在任何阻塞之前 —— TUN 模式的 StartTun 内部是 select{}，之后再起
+	// 这个 goroutine 就没机会了。
+	go watchParentForExit()
 
 	if listenAddr == "" && !tunMode {
 		flag.Usage()
@@ -276,7 +312,7 @@ func main() {
 			}
 		}
 		if !fallback {
-			if err := prepareECH(); err != nil {
+			if err := prepareECH(echStartupBudget, true); err != nil {
 				log.Fatalf("[客户端] 获取 ECH 公钥失败: %v", err)
 			}
 		} else {
@@ -321,13 +357,47 @@ func main() {
 
 	// ================= TUN 模式（仅在 Windows 启用） =================
 	if tunMode {
-		// 等待至少一条通道就绪后再启动 TUN
-		// 避免 TUN 路由建立后所有流量被劫持但 smux 通道又不可用
-		log.Printf("[TUN] 等待 smux 通道就绪（最长 60 秒）...")
-		if echPool.WaitForChannelReady(60 * time.Second) {
-			log.Printf("[TUN] 通道已就绪，启动 TUN 模式")
+		// 1) 先把 -l 指定的本地端口（socks5/http）监听起来。
+		//
+		// 必须放在等通道**之前**：Dart 侧靠「30000/30001 是否监听」判定内核
+		// 启动成功与否，而等通道最坏要 60 秒。这段时间端口没起来，界面会直接
+		// 报「代理端口未就绪，内核可能启动失败」并把内核杀掉 —— 实测踩过。
+		// 端口监听只影响本机，不像 TUN 那样接管全局流量，提前没有副作用。
+		//
+		// 另外 StartTun 内部是 select{} 会永久阻塞，之后的代码不会执行，
+		// 所以这些 goroutine 必须在这里起。
+		for _, listenerRule := range listeners {
+			rule := strings.TrimSpace(listenerRule)
+			if rule == "" {
+				continue
+			}
+			if strings.HasPrefix(rule, "socks5://") {
+				go runSOCKS5Listener(rule)
+			} else if strings.HasPrefix(rule, "http://") {
+				go runHTTPListener(rule)
+			} else if strings.HasPrefix(rule, "tcp://") {
+				go runTCPListener(rule)
+			}
+		}
+
+		// 2) 等隧道就绪再建 TUN。TUN 一建好就接管 0.0.0.0/0，此时隧道不通
+		//    等于全系统断网，所以值得等。
+		//
+		//    ★ 但 simple 协议（Worker-ECH.js）没有 smux 池：detectServerProtocol()
+		//    判定为 protoSimple 时 echPool.Start() 根本没被调用，
+		//    WaitForChannelReady 只会空等满 60 秒，而它后面的建卡代码永远执行
+		//    不到 —— 现象就是「TUN 模式无法启动 + 网卡列表里看不到 xtun」。
+		//    这种情况直接跳过，等价于原来「等满 60 秒超时后仍启动」，
+		//    只是省掉 60 秒白等（simple 是每连接新建 WS，本来就没有预热概念）。
+		if serverProtocol.Load() == protoSimple {
+			log.Printf("[TUN] 服务端为简易 WebSocket 协议（无 smux 池），跳过通道等待")
 		} else {
-			log.Printf("[TUN] 通道就绪超时（60s），仍启动 TUN（后续流量将回退直连）")
+			log.Printf("[TUN] 等待 smux 通道就绪（最长 60 秒）...")
+			if echPool.WaitForChannelReady(60 * time.Second) {
+				log.Printf("[TUN] 通道已就绪，启动 TUN 模式")
+			} else {
+				log.Printf("[TUN] 通道就绪超时（60s），仍启动 TUN（后续流量将回退直连）")
+			}
 		}
 
 		// Load geo data from files specified by -geoip / -geosite flags
@@ -361,22 +431,7 @@ func main() {
 		log.Printf("[TUN] 配置: device=%s, mtu=%d, addr=%v, routes=%v",
 			tunCfg.Name, tunCfg.MTU, tunCfg.Gateway, tunCfg.AutoSystemRoutingTable)
 
-		// 在启动 TUN 之前，先启动 -l 指定的本地监听（socks5/http）
-		// 因为 StartTun 内部 select{} 会永久阻塞，之后的代码不会执行
-		for _, listenerRule := range listeners {
-			rule := strings.TrimSpace(listenerRule)
-			if rule == "" {
-				continue
-			}
-			if strings.HasPrefix(rule, "socks5://") {
-				go runSOCKS5Listener(rule)
-			} else if strings.HasPrefix(rule, "http://") {
-				go runHTTPListener(rule)
-			} else if strings.HasPrefix(rule, "tcp://") {
-				go runTCPListener(rule)
-			}
-		}
-
+		// 本地端口已在上面（等通道之前）启动，这里直接建网卡。
 		if err := StartTun(tunCfg); err != nil {
 			log.Fatalf("[TUN] TUN 启动失败: %v", err)
 		}
@@ -963,32 +1018,91 @@ func parseSOCKS5UDPResp(packet []byte) (*net.UDPAddr, []byte, error) {
 
 const typeHTTPS = 65
 
-func prepareECH() error {
-	for {
-		log.Printf("[客户端] DNS查询 ECH: %s -> %s", dnsServer, echDomain)
+const (
+	// ★ ECH 获取按「墙钟预算」约束，不是按重试次数。
+	//
+	// 为什么不能用次数：单次查询自身最长要 3 秒（DoH client.Timeout）或 4 秒
+	// （UDP 拨号 2s + 读 2s），加上 2 秒间隔 → 每次重试最坏约 6 秒。10 次就是
+	// 最坏 60 秒，而 Dart 侧 `_waitPortsReady` 非 TUN 只等 20 秒 —— 内核还在
+	// 重试，Dart 已经判「内核可能启动失败」把它杀了，降级路径根本走不到。
+	//
+	// 预算语义：总耗时 ≤ budget + 单次查询上限（见 prepareECH 注释）。
+	//
+	// ★ 改这里必须同步看 lib/services/kernel_manager.dart 的 maxAttempts：
+	//   echStartupBudget + 4s 必须明显小于非 TUN 的等待秒数（现为 25 秒）。
+	echStartupBudget = 12 * time.Second
+	// echRefreshBudget 重连过程中刷新 ECH 的预算。要小一些，别拖慢重连。
+	// （比原来的「2 次 × 最坏 6 秒」还短，等于顺带收紧了重连延迟。）
+	echRefreshBudget = 6 * time.Second
+	// echRetryInterval 两次 ECH 尝试之间的间隔。
+	echRetryInterval = 2 * time.Second
+)
+
+// prepareECH 获取 ECH 公钥并写入 echList。
+//
+//	budget        总时间预算。循环在「再睡一轮就会超出预算」时收尾，因此
+//	              总耗时 ≤ budget + 单次查询上限（DoH 3s / UDP 4s）。
+//	degradeOnFail 失败时是否降级为普通 TLS 1.3。**只有启动路径可以传 true**。
+//
+// 至少会尝试一次（即使预算极小），避免异常配置下「一次都不试」。
+func prepareECH(budget time.Duration, degradeOnFail bool) error {
+	deadline := time.Now().Add(budget)
+
+	for attempt := 1; ; attempt++ {
+		log.Printf("[客户端] DNS查询 ECH: %s -> %s（第 %d 次，预算 %s）", dnsServer, echDomain, attempt, budget)
+
 		echBase64, err := queryHTTPSRecord(echDomain, dnsServer)
-		if err != nil {
-			log.Printf("[客户端] DNS 查询失败: %v，重试...", err)
-			time.Sleep(2 * time.Second)
-			continue
+		switch {
+		case err != nil:
+			log.Printf("[客户端] DNS 查询失败: %v", err)
+		case echBase64 == "":
+			log.Printf("[客户端] 未找到 ECH 参数")
+		default:
+			raw, derr := base64.StdEncoding.DecodeString(echBase64)
+			if derr != nil {
+				log.Printf("[客户端] ECH Base64 解码失败: %v", derr)
+				break // break 只跳出 switch，下面会走到预算判断
+			}
+			echListMu.Lock()
+			echList = raw
+			echListMu.Unlock()
+			echUnavailable.Store(false)
+			log.Printf("[客户端] ECHConfigList 长度: %d 字节（第 %d 次尝试）", len(raw), attempt)
+			return nil
 		}
-		if echBase64 == "" {
-			log.Printf("[客户端] 未找到 ECH 参数，重试...")
-			time.Sleep(2 * time.Second)
-			continue
+
+		// 再睡一轮就超预算了 —— 立刻收尾，别把启动拖到 Dart 的等待上限之外。
+		if time.Until(deadline) <= echRetryInterval {
+			break
 		}
-		raw, err := base64.StdEncoding.DecodeString(echBase64)
-		if err != nil {
-			log.Printf("[客户端] ECH Base64 解码失败: %v，重试...", err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		echListMu.Lock()
-		echList = raw
-		echListMu.Unlock()
-		log.Printf("[客户端] ECHConfigList 长度: %d 字节", len(raw))
-		return nil
+		time.Sleep(echRetryInterval)
 	}
+
+	// 预算用尽。
+	//
+	// 这里原本是 `for {}` 无退出条件 —— 只要 DoH 不可用、或地址写错（例如
+	// config.json 里的 `dns.alidns.com/dns-query` 少了 https:// 前缀，被
+	// queryHTTPSRecord 当成 UDP 主机名去 lookup），内核就永远卡在这一步：
+	// 端口永不监听，界面只报「内核可能启动失败」，日志里只有重复的
+	// 「重试...」，真正原因被埋掉。
+	//
+	// ★ 但「降级权」只给启动路径（degradeOnFail=true）。刷新路径绝不能降级：
+	//   它由「建连失败」触发，一次瞬时 DoH 抖动就会把整个会话永久降级；
+	//   而降级后错误信息里不再含 "ECH"，refreshECH 再也不会被调用 ——
+	//   本会话内**无法恢复**。刷新失败时保留原 echList 即可：Cloudflare 的
+	//   ECHConfig 寿命很长，旧配置通常仍然可用。
+	if !degradeOnFail {
+		return fmt.Errorf("ECH 公钥刷新失败（已用满 %s 预算，保留原配置）", budget)
+	}
+
+	// 启动路径：置位 echUnavailable 后照常启动，改走标准 TLS 1.3。代价是 SNI
+	// 明文传输、可能被中间设备阻断 —— 但至少内核起得来，且日志把原因写清楚了。
+	if !echUnavailable.Swap(true) {
+		log.Printf("[客户端] ⚠ ECH 公钥获取失败（已用满 %s 预算），降级为普通 TLS 1.3："+
+			"SNI 将明文传输，可能被中间设备阻断。请检查 DoH 设置（当前: %s）；"+
+			"修正后重启内核即可恢复 ECH", budget, dnsServer)
+	}
+	return nil
 }
 
 func refreshECH() error {
@@ -999,11 +1113,12 @@ func refreshECH() error {
 	refreshMu.Lock()
 	defer refreshMu.Unlock()
 	log.Printf("[客户端] 刷新 ECH 配置...")
-	return prepareECH()
+	// degradeOnFail=false：刷新失败保留原 echList，不降级（见 prepareECH 注释）。
+	return prepareECH(echRefreshBudget, false)
 }
 
 func getECHList() ([]byte, error) {
-	if fallback {
+	if fallback || echUnavailable.Load() {
 		return nil, nil
 	}
 	echListMu.RLock()
@@ -1066,7 +1181,7 @@ func buildStandardTLSConfig(serverName string) (*tls.Config, error) {
 }
 
 func buildUnifiedTLSConfig(serverName string) (*tls.Config, error) {
-	if fallback {
+	if fallback || echUnavailable.Load() {
 		return buildStandardTLSConfig(serverName)
 	}
 	ech, e := getECHList()
@@ -1222,34 +1337,46 @@ func queryHTTPSRecord(domain, dnsServer string) (string, error) {
 }
 
 func queryDNSUDP(domain, dnsServer string) (string, error) {
-	if !strings.Contains(dnsServer, ":") {
-		dnsServer = dnsServer + ":53"
+	resp, err := udpExchange(domain, dnsServer, typeHTTPS)
+	if err != nil {
+		return "", err
+	}
+	return parseDNSResponse(resp)
+}
+
+// udpExchange 走 UDP DNS 查询并返回**原始响应报文**（不限记录类型）。
+//
+// 抽出这一层是为了让「解析代理服务器域名」也能复用同一套传输：
+// 见 resolveServerIPv4 —— 它需要按 A/AAAA 查询，而不是只查 HTTPS(65)。
+func udpExchange(domain, server string, qtype uint16) ([]byte, error) {
+	if !strings.Contains(server, ":") {
+		server = server + ":53"
 	}
 
-	query := buildDNSQuery(domain, typeHTTPS)
+	query := buildDNSQuery(domain, qtype)
 
 	dialer := newPhysicalNetDialer(2 * time.Second)
-	conn, err := dialer.DialContext(context.Background(), "udp", dnsServer)
+	conn, err := dialer.DialContext(context.Background(), "udp", server)
 	if err != nil {
-		return "", fmt.Errorf("连接 DNS 服务器失败: %v", err)
+		return nil, fmt.Errorf("连接 DNS 服务器失败: %v", err)
 	}
 	defer conn.Close()
 
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	if _, err = conn.Write(query); err != nil {
-		return "", fmt.Errorf("发送查询失败: %v", err)
+		return nil, fmt.Errorf("发送查询失败: %v", err)
 	}
 
 	response := make([]byte, 4096)
 	n, err := conn.Read(response)
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return "", fmt.Errorf("DNS 查询超时")
+			return nil, fmt.Errorf("DNS 查询超时")
 		}
-		return "", fmt.Errorf("读取 DNS 响应失败: %v", err)
+		return nil, fmt.Errorf("读取 DNS 响应失败: %v", err)
 	}
-	return parseDNSResponse(response[:n])
+	return response[:n], nil
 }
 
 // dialPhysicalIPv4First 拨号时优先走 IPv4，IPv6 失败/不可达时才退回。
@@ -1280,19 +1407,29 @@ func dialPhysicalIPv4First(dialer *net.Dialer, ctx context.Context, network, add
 }
 
 func queryDoH(domain, dohURL string) (string, error) {
-	u, err := url.Parse(dohURL)
+	body, err := dohExchange(domain, dohURL, typeHTTPS)
 	if err != nil {
 		return "", err
 	}
+	return parseDNSResponse(body)
+}
+
+// dohExchange 走 DoH 查询并返回**原始响应报文**（不限记录类型）。
+// 与 udpExchange 同因：让服务器域名解析能复用同一套传输。
+func dohExchange(domain, dohURL string, qtype uint16) ([]byte, error) {
+	u, err := url.Parse(dohURL)
+	if err != nil {
+		return nil, err
+	}
 	q := u.Query()
-	dnsQuery := buildDNSQuery(domain, typeHTTPS)
+	dnsQuery := buildDNSQuery(domain, qtype)
 	dnsBase64 := base64.RawURLEncoding.EncodeToString(dnsQuery)
 	q.Set("dns", dnsBase64)
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/dns-message")
 	req.Header.Set("Content-Type", "application/dns-message")
@@ -1312,17 +1449,17 @@ func queryDoH(domain, dohURL string) (string, error) {
 	client := &http.Client{Timeout: 3 * time.Second, Transport: transport}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("DoH 状态码: %d", resp.StatusCode)
+		return nil, fmt.Errorf("DoH 状态码: %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return parseDNSResponse(body)
+	return body, nil
 }
 
 func buildDNSQuery(domain string, qtype uint16) []byte {
@@ -1381,6 +1518,60 @@ func parseDNSResponse(response []byte) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+// parseARecords 从 DNS 响应里提取全部 A / AAAA 记录（跳过 CNAME 等其它类型）。
+//
+// 走位逻辑与 parseDNSResponse 一致（跳过 question、逐条 answer、支持名字压缩
+// 指针 0xC0）。之所以要单独一个函数：优选域名（如 cdns.doon.eu.org）通常是
+// **CNAME 到某个 Cloudflare 站点**，答案里先有一条 CNAME 再跟 A 记录，
+// 不能假设第一条就是想要的类型。
+func parseARecords(response []byte) []string {
+	if len(response) < 12 {
+		return nil
+	}
+	ancount := binary.BigEndian.Uint16(response[6:8])
+	if ancount == 0 {
+		return nil
+	}
+	offset := 12
+	for offset < len(response) && response[offset] != 0 {
+		offset += int(response[offset]) + 1
+	}
+	offset += 5
+	var out []string
+	for i := 0; i < int(ancount); i++ {
+		if offset >= len(response) {
+			break
+		}
+		if response[offset]&0xC0 == 0xC0 {
+			offset += 2
+		} else {
+			for offset < len(response) && response[offset] != 0 {
+				offset += int(response[offset]) + 1
+			}
+			offset++
+		}
+		if offset+10 > len(response) {
+			break
+		}
+		rrType := binary.BigEndian.Uint16(response[offset : offset+2])
+		offset += 8
+		dataLen := binary.BigEndian.Uint16(response[offset : offset+2])
+		offset += 2
+		if offset+int(dataLen) > len(response) {
+			break
+		}
+		data := response[offset : offset+int(dataLen)]
+		offset += int(dataLen)
+		switch {
+		case rrType == 1 && len(data) == 4: // A
+			out = append(out, net.IP(data).String())
+		case rrType == 28 && len(data) == 16: // AAAA
+			out = append(out, net.IP(data).String())
+		}
+	}
+	return out
 }
 
 func parseHTTPSRecord(data []byte) string {
@@ -2136,7 +2327,11 @@ func humanRate(n int64, d time.Duration) string {
 
 // proxyConnStream 双向转发。结束时若传输量较大则输出该连接的实际吞吐，
 // 用于判断瓶颈究竟在窗口（窗口/RTT）还是别处。
-func proxyConnStream(c net.Conn, stream *smux.Stream, target string) {
+// proxyConnStream 把客户端连接与出站流对接。
+//
+// stream 用 net.Conn 而不是 *smux.Stream：出站既可能是 smux 池里的流，
+// 也可能是 simple 协议每连接新建的 WS（simpleWSConn），两者都满足 net.Conn。
+func proxyConnStream(c net.Conn, stream net.Conn, target string) {
 	start := time.Now()
 	up := &countWriter{w: stream}
 	down := &countWriter{w: c}
@@ -2494,7 +2689,26 @@ type srvIPEntry struct {
 const (
 	srvIPTTL       = 5 * time.Minute
 	srvIPResolveTO = 3 * time.Second
+	// srvIPCtrlBudget 控制面 DNS（配置值 + 内置 DoH 兜底）的总时间预算。
+	// 单条查询最坏吃满 3 秒超时，不设预算的话「DNS 全挂」会把启动拖到十几秒。
+	srvIPCtrlBudget = 5 * time.Second
 )
+
+// builtinDoHFallbacks 配置里的 DNS 不可用时的内置 DoH 兜底。
+//
+// 只用于解析**代理服务器自己的域名**（控制面），不用于 ECH、更不用于用户流量。
+//
+// 存在的理由：这一步如果直接退回系统解析器，在已被污染的网络里就会拿到假的
+// 服务器 IP，代理直接不可用（见 resolveServerIPv4 的长注释）。所以宁可多问几个
+// 公共 DoH，也别用污染结果。顺序按国内可达性排，Cloudflare 放最后（国内常不通）。
+//
+// 单元测试里可以把它置空，避免测试真的去打网络（见 resolve_poison_test.go）。
+var builtinDoHFallbacks = []string{
+	"https://223.5.5.5/dns-query",
+	"https://dns.alidns.com/dns-query",
+	"https://doh.pub/dns-query",
+	"https://1.1.1.1/dns-query",
+}
 
 // cachedServerIP 返回 host 的缓存解析结果（IPv4 优先），拿不到时返回空串，
 // 交给调用方按原样走 net.Dialer 的解析（即缓存前的老行为）。
@@ -2536,27 +2750,157 @@ func cachedServerIP(host string) string {
 
 // resolveServerIPv4 解析代理服务器域名，IPv4 优先。
 //
-// 这里解析的是「代理服务器自己的域名」，属于控制面，必须走本地系统解析器
-// （不能走隧道，否则成了鸡生蛋问题）。IPv4 优先是因为实测部分网络下 IPv6
-// DNS 路由不通，解析会先卡一轮超时。
+// ★ 必须走**配置的 DoH/UDP DNS**（控制面 DNS），不能只靠系统解析器。
+//
+// 2026-09-23 真机事故：用户把 `ip` 设成优选域名 `cdns.doon.eu.org`
+// （CNAME 到某个被墙的 Cloudflare 站点）。运营商 DNS（电信 IPv6 DNS）对这个
+// 域名返回**污染结果** `8.134.121.112`（阿里云 IP），而正确结果是
+// `104.18.42.54 / 172.64.145.202`。内核信了污染值，把全部流量拨向那个死 IP，
+// 日志刷满 `dial tcp 8.134.121.112:443: i/o timeout`，表现为「每次关闭后
+// 重新启动都失败」。同一域名的 AAAA 也被污染出 `2406:cb42:0:f00e::49bd` ——
+// 之前以为是「v6 混进池子」，其实根因就是污染。
+//
+// 所以顺序是：**先问控制面 DNS（DoH/UDP），拿不到再退回系统解析器**。
+// 两路都有结果但不一致时，采用控制面结果并打警告（这正是污染的指纹）。
+//
+// 仍不能用隧道解析（鸡生蛋问题），DoH/UDP 走的是物理网卡（newPhysicalNetDialer）。
+// IPv4 优先是因为实测部分网络下 IPv6 DNS 路由不通，解析会先卡一轮超时。
 func resolveServerIPv4(host string) []string {
+	ctrl := resolveViaControlPlaneDNS(host)
+	sys := resolveViaSystemResolver(host)
+
+	var ips []string
+	switch {
+	case len(ctrl) > 0 && len(sys) > 0 && !sameIPSet(ctrl, sys):
+		log.Printf("[客户端] ⚠ 服务器域名 %s 两路解析结果不一致：控制面 DNS=%v，系统解析器=%v。"+
+			"采用控制面 DNS 的结果（系统解析器很可能被运营商 DNS 污染）", host, ctrl, sys)
+		ips = ctrl
+	case len(ctrl) > 0:
+		ips = ctrl
+	default:
+		// 控制面 DNS 全部不可用（配置值 + 内置 DoH 都失败）时不能把启动卡死，
+		// 退回系统解析器 —— 但要把风险写进日志，否则「代理突然全挂」无从查起。
+		if len(sys) == 0 {
+			return nil
+		}
+		log.Printf("[客户端] ⚠ 服务器域名 %s 的控制面 DNS 全部不可用（已试配置值 %q 与内置 DoH），"+
+			"退回系统解析器 —— 当前网络若存在 DNS 污染，这里拿到的可能是错误 IP", host, dnsServer)
+		ips = sys
+	}
+
+	var v4s, v6s []string
+	for _, s := range ips {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			v4s = append(v4s, v4.String())
+		} else {
+			v6s = append(v6s, ip.String())
+		}
+	}
+	// IPv4 优先：实测部分网络下 IPv6 路由不通，解析出来也连不上。
+	//
+	// 只要有 IPv4 就**只**返回 IPv4 —— 绝不能把 v6 混进候选池。
+	// cachedServerIP 是按 srvRotate 在池子里轮转选入口的，池里混进一个
+	// 连不上的 v6，就会每轮转到它一次、白白超时一次。
+	// 只有一条 IPv4 都没有时才退回 v6。
+	if len(v4s) > 0 {
+		return v4s
+	}
+	return v6s
+}
+
+// resolveViaControlPlaneDNS 解析代理服务器域名：
+//   1) 先问配置的 DNS（`-dns`，DoH 或 UDP）；
+//   2) 它不可用时，退而问内置 DoH 列表 —— **不要**直接退回系统解析器，那里很
+//      可能全是运营商的污染结果（在已被污染的网络里等于代理直接不可用）；
+//   3) 内置 DoH 也全挂了才由调用方退回系统解析器。
+//
+// dnsServer 为空（例如单元测试里没走 flag 解析）时跳过第 1 步。
+func resolveViaControlPlaneDNS(host string) []string {
+	if dnsServer != "" {
+		if ips := exchangeARecords(host, dnsServer); len(ips) > 0 {
+			return ips
+		}
+	}
+	deadline := time.Now().Add(srvIPCtrlBudget)
+	for _, u := range builtinDoHFallbacks {
+		if u == dnsServer {
+			continue
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		if ips := exchangeARecords(host, u); len(ips) > 0 {
+			if dnsServer == "" {
+				log.Printf("[客户端] 服务器域名 %s：已用内置 DoH(%s) 解析", host, u)
+			} else {
+				log.Printf("[客户端] ⚠ 服务器域名 %s：配置的 DNS(%s) 不可用，已改用内置 DoH(%s) 解析。"+
+					"建议把「DoH 服务器」改成一个当前网络能连通的地址", host, dnsServer, u)
+			}
+			return ips
+		}
+	}
+	return nil
+}
+
+// exchangeARecords 用指定 DNS 服务器查 A 记录。
+//
+// 只查 A 不查 AAAA：一条查询最坏要吃满 3 秒超时，而优选域名基本都是 CNAME 到
+// Cloudflare 站点、只有 A 记录（实测 AAAA 查询只返回 CNAME）。服务器不可达时
+// 再去问一遍 AAAA 纯属浪费时间，直接换下一个 DNS 更快。
+func exchangeARecords(host, server string) []string {
+	var resp []byte
+	var err error
+	if strings.HasPrefix(server, "http://") || strings.HasPrefix(server, "https://") {
+		resp, err = dohExchange(host, server, dnsTypeA)
+	} else {
+		resp, err = udpExchange(host, server, dnsTypeA)
+	}
+	if err != nil {
+		return nil
+	}
+	return parseARecords(resp)
+}
+
+// resolveViaSystemResolver 走本地系统解析器（老行为），作为控制面 DNS 的兜底。
+func resolveViaSystemResolver(host string) []string {
 	ctx, cancel := context.WithTimeout(context.Background(), srvIPResolveTO)
 	defer cancel()
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil || len(addrs) == 0 {
 		return nil
 	}
-	var v4s, v6s []string
+	out := make([]string, 0, len(addrs))
 	for _, a := range addrs {
-		if v4 := a.IP.To4(); v4 != nil {
-			v4s = append(v4s, v4.String())
-		} else {
-			v6s = append(v6s, a.IP.String())
+		out = append(out, a.IP.String())
+	}
+	return out
+}
+
+// sameIPSet 比较两组 IP 是否完全相同（顺序无关，各自内部去重）。
+func sameIPSet(a, b []string) bool {
+	set := func(s []string) map[string]struct{} {
+		m := make(map[string]struct{}, len(s))
+		for _, v := range s {
+			if ip := net.ParseIP(v); ip != nil {
+				m[ip.String()] = struct{}{}
+			}
+		}
+		return m
+	}
+	ma, mb := set(a), set(b)
+	if len(ma) != len(mb) {
+		return false
+	}
+	for k := range ma {
+		if _, ok := mb[k]; !ok {
+			return false
 		}
 	}
-	// IPv4 优先：实测部分网络下 IPv6 路由不通，解析出来也连不上。
-	// IPv6 结果保留在后面当兜底，只有完全没有 IPv4 时才用得上。
-	return append(v4s, v6s...)
+	return true
 }
 
 func (p *ECHPool) dialWebSocketWithECH(addr string, retries int, ip string, clientID string, channelID int) (*websocket.Conn, error) {

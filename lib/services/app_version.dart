@@ -18,5 +18,5 @@
 /// 收不到 v1.0.0 的更新（相等不算新），只会收到更高的版本。
 const String kAppVersion = String.fromEnvironment(
   'ECHOS_VERSION',
-  defaultValue: '1.0.9',
+  defaultValue: '1.1.0',
 );

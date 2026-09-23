@@ -7,6 +7,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'app_paths.dart';
 import 'app_state.dart';
+import 'log_service.dart';
 
 class TrayService with TrayListener {
   static final TrayService instance = TrayService._();
@@ -16,14 +17,21 @@ class TrayService with TrayListener {
 
   AppState get _app => AppState.instance;
 
-  /// 已写入临时目录的图标路径（蓝=已接管，橙=未接管）
+  /// 已写入临时目录的图标路径（蓝=代理在生效，橙=未生效）
   String? _trayBlueIcon;
   String? _trayOraIcon;
 
+  /// 代理是否在生效 —— 决定托盘图标颜色。
+  ///
+  /// ★ TUN 模式**故意不接管系统代理**（流量走虚拟网卡），所以 `proxyReady`
+  ///   在 TUN 下恒为 false。只看它的话，TUN 明明正常工作、托盘却一直是橙的。
+  ///   凡「代理是否在生效」的判定都要走这个二选一，不能只看系统代理。
+  bool get _proxyActive => _app.proxyReady || _app.tunActive;
+
   Future<void> init() async {
     await _writeIcons();
-    _lastReady = _app.proxyReady;
-    await _applyIcon(_app.proxyReady);
+    _lastActive = _proxyActive;
+    await _applyIcon(_proxyActive);
     await trayManager.setToolTip('EchOS');
     _lastDockIcon = _app.config.showDockIcon;
     _applyDockIcon();
@@ -35,15 +43,15 @@ class TrayService with TrayListener {
   /// AppState 的 notifyListeners() 调用点很多（日志、状态、配置…），
   /// 而每次都会走到这里；无条件重发 IPC 会在高频日志下持续占用 UI 线程，
   /// 表现为右键托盘菜单的 hover 药丸不跟手。
-  bool? _lastReady;
+  bool? _lastActive;
   bool? _lastDockIcon;
 
   void _onState() {
     _rebuildMenu(); // 内部自带内容指纹去重，无变化时直接返回
-    final ready = _app.proxyReady;
-    if (ready != _lastReady) {
-      _lastReady = ready;
-      _applyIcon(ready);
+    final active = _proxyActive;
+    if (active != _lastActive) {
+      _lastActive = active;
+      _applyIcon(active);
     }
     // 配置变化时同步任务栏图标可见性（勾选「在任务栏显示图标」后立即生效）
     final dock = _app.config.showDockIcon;
@@ -70,6 +78,17 @@ class TrayService with TrayListener {
         break;
       case 'toggle':
         app.toggle();
+        break;
+      case 'tun':
+        final wantOn = !app.config.tunMode;
+        // 开 TUN 要过「管理员权限」和「wintun.dll 是否存在」两道校验，任一不过
+        // 都会弹框说明；而托盘状态下主窗口是隐藏的，不先亮出来，用户只会觉得
+        // 「点了没反应」。关 TUN 不弹框，就不打扰了。
+        if (wantOn) {
+          windowManager.show();
+          windowManager.focus();
+        }
+        app.setTunMode(wantOn);
         break;
       case 'update':
         // 先把主窗口带到前台，更新弹窗才不会被埋在不可见的托盘状态下
@@ -102,6 +121,11 @@ class TrayService with TrayListener {
     if (app.isRunning || app.isStarting) {
       await app.stop();
     }
+    // 退出前排空日志队列：stop() 刚写的收尾日志（内核的
+    // `标准输入已关闭` / `[TUN] TUN 网卡已关闭` / `清理完成，退出`，
+    // 以及 Dart 侧的 `内核已退出（状态码 N）`）还在异步写队列里，
+    // exit(0) 一到就整段丢 —— 那正是排查 TUN 网卡有没有残留的唯一依据。
+    await LogService.instance.flush();
     exit(0);
   }
 
@@ -117,6 +141,7 @@ class TrayService with TrayListener {
     final servers = app.config.servers;
     final sig = [
       running,
+      app.config.tunMode,
       app.config.showDockIcon,
       servers.length,
       app.selected?.id,
@@ -128,6 +153,11 @@ class TrayService with TrayListener {
       MenuItem(key: 'show', label: '显示应用'),
       MenuItem(type: 'separator'),
       MenuItem(key: 'toggle', label: 'ECH 代理', checked: running),
+      // TUN 模式开关：与主界面那个是同一个 config.tunMode。
+      // 勾选反映「用户意图」（配置值）而非「此刻是否真生效」—— 和主界面口径一致。
+      // 不能绑 tunActive（那个还要求 isRunning && 管理员），否则非管理员时
+      // 显示未勾选，用户点一下以为没反应，其实是弹了提权框。
+      MenuItem(key: 'tun', label: 'TUN 模式', checked: app.config.tunMode),
       MenuItem.submenu(
           key: 'servers',
           label: '代理服务器',
@@ -153,9 +183,10 @@ class TrayService with TrayListener {
     } catch (_) {}
   }
 
-  /// 对齐 Mac 菜单栏：代理已接管（proxyReady）→ 蓝；否则 → 橙。
-  Future<void> _applyIcon(bool ready) async {
-    if (ready) {
+  /// 对齐 Mac 菜单栏：代理在生效（系统代理已接管，或 TUN 已跑起来）→ 蓝；
+  /// 否则 → 橙。
+  Future<void> _applyIcon(bool active) async {
+    if (active) {
       if (_trayBlueIcon != null) {
         await trayManager.setIcon(_trayBlueIcon!);
       }

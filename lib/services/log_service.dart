@@ -195,12 +195,40 @@ class LogService {
     });
   }
 
-  void close() {
+  /// 等待已入队的日志全部落盘。
+  ///
+  /// **退出前必须调用**：`exit(0)` 会立刻结束进程，而日志是走 [_fileQueue]
+  /// 异步链写的 —— 队列里还没执行的行会整段丢失。典型受害者是内核退出前打的
+  /// 最后几行（`标准输入已关闭` / `[TUN] TUN 网卡已关闭` / `清理完成，退出`）
+  /// 以及 `内核已退出（状态码 N）`，而这几行恰恰是排查「TUN 网卡有没有干净
+  /// 卸掉」的唯一依据。
+  ///
+  /// 实测对照（同一时刻的两个文件）：
+  ///   kernel.log（_persist 同步写）  → 完整
+  ///   latest.log（本队列异步写）     → 缺 `清理完成，退出` 和 `内核已退出`
+  ///
+  /// 为什么是循环而不是单次 `await`：await 期间可能还有新行入队 ——
+  /// 内核 stdout 的最后一两个数据块常晚于 `exitCode` 到达（事件循环调度顺序
+  /// 不保证）。单次 await 只等到「当时那条链」，会漏掉后到的那些。
+  Future<void> flush() async {
+    for (var i = 0; i < 200; i++) {
+      final pending = _fileQueue;
+      try {
+        await pending;
+      } catch (_) {}
+      if (identical(pending, _fileQueue)) return;
+    }
+  }
+
+  /// 关闭日志文件：先让已入队的日志落盘，再禁止后续写入。
+  ///
+  /// 顺序不能颠倒 —— 先置 [_closed] 的话，队列里尚未执行的任务会在
+  /// `_writeFileLine` 开头的 `if (_closed) return;` 处被直接丢弃。
+  Future<void> close() async {
+    await flush();
     _closed = true;
-    _fileQueue = _fileQueue.then((_) {
-      _current = null;
-      _check = null;
-    });
+    _current = null;
+    _check = null;
   }
 
   /// 打开当前视图对应的日志文件（在资源管理器中定位选中）。

@@ -122,10 +122,31 @@ class KernelManager {
     return null;
   }
 
+  /// 内核程序所在目录（打包后 = echos.exe 同目录）。找不到内核返回 null。
+  String? kernelDir() {
+    final p = kernelPath();
+    return p == null ? null : File(p).parent.path;
+  }
+
+  /// TUN 模式的硬依赖：wintun.dll 必须和内核同目录。
+  ///
+  /// 内核用 `LoadLibraryEx("wintun.dll", …, LOAD_LIBRARY_SEARCH_APPLICATION_DIR
+  /// | LOAD_LIBRARY_SEARCH_SYSTEM32)` 加载它，只认「程序目录」和 System32；
+  /// 放别处等于没有。所以这里也按同一个口径检查。
+  bool wintunDllPresent() {
+    final dir = kernelDir();
+    if (dir == null) return false;
+    return File('$dir${Platform.pathSeparator}wintun.dll').existsSync();
+  }
+
   /// 启动内核；返回错误提示（空=成功启动流程）
+  ///
+  /// [tun] = true 时以 TUN 模式启动（追加 `-tun`）。调用方负责先确认管理员
+  /// 权限与 wintun.dll —— 这两条内核自己只会报一句加载失败，说不清原因。
   Future<String?> start(ServerConfig cfg, RouteMode mode,
       {required void Function(String line) log,
       List<CustomRule>? rules,
+      bool tun = false,
       void Function(int code)? onExit}) async {
     if (isRunning || isStarting) return null;
 
@@ -168,10 +189,18 @@ class KernelManager {
     }
 
     final args = cfg.arguments(
-        listen: null, geoip: geoip, geosite: geosite, mode: mode, rules: rules);
+        listen: null,
+        geoip: geoip,
+        geosite: geosite,
+        mode: mode,
+        rules: rules,
+        tun: tun);
 
     isStarting = true;
     log('[系统] 正在启动内核进程…');
+    if (tun) {
+      log('[系统] TUN 模式：内核将创建虚拟网卡接管全部流量（不再设置系统代理）');
+    }
     try {
       final proc = await Process.start(path, args,
           mode: ProcessStartMode.normal,
@@ -208,19 +237,34 @@ class KernelManager {
       log('[系统] 本地端口 SOCKS5 ${activeSocks!.host}:${activeSocks!.port}');
     }
     log('[系统] 正在等待代理端口就绪…');
-    await _waitPortsReady(log);
+    await _waitPortsReady(log, tun: tun);
     return null;
   }
 
-  Future<void> _waitPortsReady(void Function(String) log) async {
+  Future<void> _waitPortsReady(void Function(String) log,
+      {bool tun = false}) async {
     if (activeSocks == null) {
       isStarting = false;
       return;
     }
     final port = activeSocks!.port;
-    // 20 次×1s：境外 DoH/UDP DNS 时通时不通，ECH+通道建立可能超过 10s，
+    // 25 次×1s：境外 DoH/UDP DNS 时通时不通，ECH+通道建立可能超过 10s，
     // 只要进程还活着且正在推进，就多等一会，别把"慢但能成"的启动杀掉。
-    for (var attempt = 1; attempt <= 20; attempt++) {
+    //
+    // ★ 与内核的 ECH 启动预算**耦合**（x-tunnel.go 的 echStartupBudget = 12s）：
+    //   内核取 ECH 公钥最多花「预算 + 单次查询上限 4s」≈ 16s，之后才开始监听
+    //   端口。这里的等待必须明显大于它，否则内核还在重试、这边已经判「内核可能
+    //   启动失败」把进程杀掉 —— 内核那条「取不到 ECH 就降级为普通 TLS 1.3」的
+    //   兜底就永远走不到，用户看到的就是「内核起不来」而不是「ECH 降级了」。
+    //   改任何一边都要同步核对另一边。
+    //
+    // TUN 模式要等更久：内核刻意**先等 smux 通道就绪（最长 60 秒）再建 TUN**，
+    // 因为一旦路由把全部流量劫持进去、通道却不可用，就是彻底断网。这段时间
+    // 本地监听也还没起来（内核把它们的启动放在 StartTun 之前、通道就绪之后），
+    // 所以按非 TUN 的 20 秒口径会把「正常但慢」的 TUN 启动误判成失败。
+    // （ECH 预算 ≈16s + 通道最长 60s = 76s，90s 仍有余量。）
+    final maxAttempts = tun ? 90 : 25;
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
       if (!isStarting || !_processAlive) {
         isStarting = false;
         return;
@@ -280,12 +324,29 @@ class KernelManager {
     final p = _process;
     _process = null;
     if (p != null) {
+      // 先走「关闭 stdin」的优雅路径，再兜底强杀。
+      //
+      // 为什么不能直接 kill：Windows 上 Process.kill 就是 TerminateProcess，
+      // 进程内收不到任何通知。非 TUN 模式下无非是 socket 被系统收走，无所谓；
+      // **TUN 模式下会留下 Wintun 虚拟网卡和它设的路由/DNS**，轻则网卡列表里
+      // 多一个「xtun」，重则路由还指着已死的网卡。内核读到 stdin EOF 会先
+      // 关闭 TUN 网卡再 exit(0)，所以这一步不能省。
+      //
+      // 旧内核（不认识 stdin EOF）在这里会白等满 3 秒才被强杀 —— 可接受：
+      // 应用与内核同包发布，不存在长期错配。
       try {
-        p.kill(ProcessSignal.sigterm);
+        await p.stdin.close();
       } catch (_) {}
-      // 最多等 3 秒退出；仍不退则强杀
-      final exited = await p.exitCode.timeout(const Duration(seconds: 3),
-          onTimeout: () => -1);
+      var exited = await p.exitCode
+          .timeout(const Duration(seconds: 3), onTimeout: () => -1);
+      if (exited < 0) {
+        try {
+          p.kill(ProcessSignal.sigterm);
+        } catch (_) {}
+        exited = await p.exitCode
+            .timeout(const Duration(seconds: 3), onTimeout: () => -1);
+      }
+      // 仍不退则强杀
       if (exited < 0) {
         try {
           p.kill(ProcessSignal.sigkill);
