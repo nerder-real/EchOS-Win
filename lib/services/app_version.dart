@@ -20,7 +20,7 @@ import 'dart:io' show Platform;
 /// 收不到 v1.0.0 的更新（相等不算新），只会收到更高的版本。
 const String kAppVersion = String.fromEnvironment(
   'ECHOS_VERSION',
-  defaultValue: '1.2.4',
+  defaultValue: '1.3.0',
 );
 
 /// 对外上报用的「版本 + 平台」标识（授权服务 /verify、/activate 的

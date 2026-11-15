@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -88,13 +87,31 @@ func dialTargetWithRoute(target string) (*outbound, error) {
 		return nil, errBlocked
 
 	case DecisionDirect:
-		c, err := net.DialTimeout("tcp", target, 5*time.Second)
+		// 解析补判给出的 direct 是探测性的，不是名单拍板的：DNS 投毒会
+		// 把假 IP 判成 direct（假 IP 池里有 198.18.x 这类 geoip:private
+		// 保留段，被墙域名因此被误判成直连），真拨号必然超时。这类直连的
+		// 超时压到 1.2s，失败写负缓存——后续连接直接走隧道，不再重付罚时。
+		timeout := 5 * time.Second
+		rescue := strings.Contains(reason, "(解析自域名)")
+		if rescue {
+			timeout = 1200 * time.Millisecond
+		}
+		c, err := net.DialTimeout("tcp", target, timeout)
 		if err != nil {
 			// 直连失败不代表该走代理：可能就是站点挂了。
 			// 但对国内被墙域名误判成 direct 的情况，退回代理能救回来。
 			// wpad 是 macOS 的代理自动发现，它本来就查不到，不值得当错误刷屏
 			if !strings.HasPrefix(target, "wpad:") {
 				log.Printf("[分流] 直连 %s 失败(%v)，改走代理", target, err)
+			}
+			if rescue {
+				// 负缓存只记「探测性 direct 失败」：名单拍板的 direct（用户
+				// 自定义规则 / geoip 直连）失败不写——站点真挂了不该影响
+				// 后续判定。hit=true 走 resolvedRouteTTL（10 分钟）。
+				resolvedRouteCache.Store(host, resolvedRoute{
+					decision: DecisionProxy, reason: "直连探测失败回落",
+					at: time.Now(), hit: true,
+				})
 			}
 			return dialViaTunnel(target)
 		}
@@ -255,7 +272,6 @@ func logRouteEvent(c net.Conn, reqType, target string, ob *outbound, opened bool
 	log.Printf("[客户端] %s %s %s %s 通道 %d", clientSourceAddr(c), reqType, arrow, target, ob.channelID)
 }
 
-
 // resolvedRouteCache 缓存"域名 → 路由判定"，避免每条连接都去解析一次 DNS。
 var resolvedRouteCache sync.Map
 
@@ -279,7 +295,29 @@ const resolvedRouteMissTTL = 60 * time.Second
 // routeByResolvedIP 把域名解析成 IP，再按 geoip 规则判一次。
 // 第三个返回值表示"是否得到了有效判定"——解析失败或规则没命中都返回 false，
 // 让调用方保持原来的默认决策。
+// cnDirectRulePresent：规则里是否存在 CN 直连规则（geosite:cn / geoip:cn）。
+// 解析补判的存在意义是把名单外的国内小站救回直连，只有「绕过大陆」类策略
+// （默认代理 + CN 直连规则）才需要它；全局/默认直连策略下补判没有这个语义
+// ——投毒假 IP 反而会把连接翻成 direct 再吃满超时。
+func cnDirectRulePresent() bool {
+	for _, r := range routeRules {
+		if r.Decision != DecisionDirect {
+			continue
+		}
+		v := strings.ToLower(r.Value)
+		if strings.Contains(v, "geosite:cn") || strings.Contains(v, "geoip:cn") {
+			return true
+		}
+	}
+	return false
+}
+
 func routeByResolvedIP(host string) (RouteDecision, string, bool) {
+	// 解析补判只在「默认代理 + 存在 CN 直连规则」的分流策略下启用（见
+	// cnDirectRulePresent 注释）。
+	if defaultRouteDecision != DecisionProxy || !cnDirectRulePresent() {
+		return DecisionNone, "", false
+	}
 	if v, ok := resolvedRouteCache.Load(host); ok {
 		if rr, _ := v.(resolvedRoute); time.Since(rr.at) < rr.ttl() {
 			return rr.decision, rr.reason, rr.hit

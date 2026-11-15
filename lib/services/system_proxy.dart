@@ -16,6 +16,10 @@ class SystemProxy {
   // 2-4：备份绕过列表与 PAC，还原时按原值写回（原无则删除，不留接管残留）
   static String? _savedProxyOverride;
   static String? _savedAutoConfig;
+  /// TUN 让位清空标记：系统代理当前是「为 TUN 清空」的状态，注册表里的值
+  /// **不是用户原值**——备份必须保持为清空前的原样（退出/关 TUN 时按原值还原），
+  /// 且此状态下不能再做新备份（会用空值覆盖原始备份）。
+  static bool tunCleared = false;
 
   /// 备份持久化目录（AppData/EchOS）
   static String? _backupDir;
@@ -124,6 +128,58 @@ class SystemProxy {
     return warns;
   }
 
+  /// TUN 让位：把系统代理**清空**（全部关闭），不是还原备份。
+  ///
+  /// 为什么是清空而不是还原：还原会把备份里的第三方代理（v2rayN 的
+  /// 127.0.0.1:10808）写回去，浏览器流量在**应用层**被它截走、根本不进
+  /// TUN 的 IP 层接管——用户感知「TUN 开了网页打不开」（Mac 同病实录，
+  /// TUN 存活 77 秒仅 3 条 TCP、461 条 DNS 全部绕行）。
+  ///
+  /// 语义：①清空前确保有备份（否则清空不可逆地丢掉第三方代理原值）；
+  /// ②备份原样保留，关 TUN / 退出时按原值还原；③写完必须读回验证
+  /// （注册表偶发「返回成功却没写」），失败重试一次，仍失败留醒目警告。
+  static Future<({bool ok, List<String> warns})> clearForTun() async {
+    final warns = <String>[];
+    try {
+      await _backup();
+      for (var attempt = 1; attempt <= 2; attempt++) {
+        await _regSet(_regKey, 'ProxyEnable', 0);
+        await _regDelete(_regKey, 'ProxyServer');
+        // PAC 与手动代理并存时 PAC 会抢答，TUN 期间一并清掉（原值在备份里）
+        if (_savedAutoConfig != null) {
+          await _regDelete(_regKey, 'AutoConfigURL');
+        }
+        await _notifySettingChange();
+        final r = await Process.run(
+            'reg', ['query', _regKey, '/v', 'ProxyEnable'], runInShell: true);
+        if (!(r.stdout as String).contains('0x1')) {
+          tunCleared = true;
+          return (ok: true, warns: warns);
+        }
+        if (attempt == 1) warns.add('TUN 清空系统代理第一次未生效，已重试');
+      }
+      tunCleared = false;
+      warns.add('TUN 清空系统代理失败：系统代理仍处于启用状态，'
+          '浏览器流量可能不经过隧道');
+      return (ok: false, warns: warns);
+    } catch (e) {
+      warns.add('TUN 清空系统代理失败：$e');
+      return (ok: false, warns: warns);
+    }
+  }
+
+  /// TUN 巡逻专用：系统代理被任何工具重新启用时返回其地址，否则 null。
+  /// 与 [stolenBy] 的区别：不要求 isActive（TUN 让位后本工具没接管系统代理），
+  /// 且任何 ProxyEnable=1 都算残留——TUN 生效期间系统代理必须为空，
+  /// 否则应用层代理会截走本该进 TUN 的流量。
+  static Future<String?> tunResidue() async {
+    final r = await Process.run(
+        'reg', ['query', _regKey, '/v', 'ProxyEnable'], runInShell: true);
+    if (!(r.stdout as String).contains('0x1')) return null;
+    final server = await _regQuerySz(_regKey, 'ProxyServer') ?? '';
+    return server.isEmpty ? '(已启用，未设地址)' : server;
+  }
+
   /// 代理地址（host:port 形式）是否还有进程在监听。
   ///
   /// 只对「IPv4/主机名:端口」这种无歧义形态真正探活；其余写法——分协议
@@ -216,6 +272,11 @@ class SystemProxy {
   }
 
   static Future<void> _backup() async {
+    if (tunCleared) {
+      // TUN 清空态的注册表不是用户原值：此时重新备份会用「空」覆盖原始备份，
+      // 之后 restore 就再也还原不回用户真正的配置了。
+      return;
+    }
     try {
       final r = await Process.run(
           'reg', ['query', _regKey, '/v', 'ProxyEnable'], runInShell: true);

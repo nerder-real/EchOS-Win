@@ -292,6 +292,10 @@ func main() {
 	}
 
 	if tunMode {
+		// 边缘优选探针的 TUN 逃逸标记：TUN 劫持默认路由后，探针流量需要
+		// 物理网卡绑定（Win 的 WS 拨号器已内置 bindSocketToPhysNIC），
+		// 这个标记供 tun_iprank 的 TUN 分支感知。
+		SetTunActive(true)
 		// 先准备物理网卡索引，供 ECH 查询和首批 WebSocket 连接绑定使用。
 		// 后续仅在当前索引失效时才重新探测，而不是每次重连都重探测。
 		ensurePhysIfaceIndex()
@@ -347,6 +351,21 @@ func main() {
 	log.Printf("[客户端] 客户端ID: %s", clientID)
 
 	echPool = NewECHPool(forwardAddr, connectionNum, targetIPs, clientID)
+	// 边缘优选复测循环（03-边缘优选，对齐 Mac bfffa55）：每 5 分钟对候选做
+	// 存活 + 吞吐筛选（探针走完整用户路径：边缘→Worker→外部测速源），结果
+	// 原子替换 targetIPs——simple WS 路径的粘性主选与冷却都读它。
+	// ensureEdgeRoutes 保持 nil：Win 的 WS 拨号器已内置 bindSocketToPhysNIC
+	// 物理网卡绑定，探针流量天然绕过 TUN，无需主机路由。
+	go func() {
+		ticker := time.NewTicker(rerankInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			ranked := rankCandidateIPs(echPool.wsServerAddr, echPool.currentTargetIPs())
+			if len(ranked) > 0 {
+				echPool.setTargetIPs(ranked)
+			}
+		}
+	}()
 	// 本地分流 + 服务端协议判定（对齐 Mac v1.2.9）：本地代理也过 -route 规则，
 	// 简易协议（Worker-ECH.js）→ 每连接新建 WS，不预热 smux 池。
 	initLocalRouting()
@@ -1523,7 +1542,7 @@ func parseDNSResponse(response []byte) (string, error) {
 // parseARecords 从 DNS 响应里提取全部 A / AAAA 记录（跳过 CNAME 等其它类型）。
 //
 // 走位逻辑与 parseDNSResponse 一致（跳过 question、逐条 answer、支持名字压缩
-// 指针 0xC0）。之所以要单独一个函数：优选域名（如 cdns.doon.eu.org）通常是
+// 指针 0xC0）。之所以要单独一个函数：优选域名通常是
 // **CNAME 到某个 Cloudflare 站点**，答案里先有一条 CNAME 再跟 A 记录，
 // 不能假设第一条就是想要的类型。
 func parseARecords(response []byte) []string {
@@ -2113,12 +2132,21 @@ type ECHPool struct {
 	targetIPs     []string
 	clientID      string
 
+	// targetIPs 由边缘优选复测循环原子替换（rankCandidateIPs → setTargetIPs），
+	// 读取方（pickIP 等）走 RLock。初始值在 NewECHPool 赋一次，此后只经 setter 变更。
+	targetIPsMu sync.RWMutex
+
 	wsConnsMu     sync.RWMutex
 	smuxConns     []*smux.Session
 	channelRTT    []int64
 	selectCounter uint64
 	readyCh       chan struct{}
 	readyOnce     sync.Once
+
+	// 边缘冷却：拨号失败 markEdgeFail 冷却 60s（粘性主选自动跳次位），
+	// 成功 markEdgeOK 解除。两函数各持 edgeMu。
+	edgeMu        sync.Mutex
+	edgeFailUntil map[string]time.Time
 }
 
 func NewECHPool(addr string, n int, ips []string, clientID string) *ECHPool {
@@ -2134,6 +2162,7 @@ func NewECHPool(addr string, n int, ips []string, clientID string) *ECHPool {
 		smuxConns:     make([]*smux.Session, total),
 		channelRTT:    make([]int64, total),
 		readyCh:       make(chan struct{}, 1),
+		edgeFailUntil: make(map[string]time.Time),
 	}
 	return p
 }
@@ -2683,7 +2712,7 @@ var (
 
 type srvIPEntry struct {
 	ips []string
-	at time.Time
+	at  time.Time
 }
 
 const (
@@ -2752,7 +2781,7 @@ func cachedServerIP(host string) string {
 //
 // ★ 必须走**配置的 DoH/UDP DNS**（控制面 DNS），不能只靠系统解析器。
 //
-// 2026-09-23 真机事故：用户把 `ip` 设成优选域名 `cdns.doon.eu.org`
+// 2026-09-23 真机事故：用户把 `ip` 设成优选域名
 // （CNAME 到某个被墙的 Cloudflare 站点）。运营商 DNS（电信 IPv6 DNS）对这个
 // 域名返回**污染结果** `8.134.121.112`（阿里云 IP），而正确结果是
 // `104.18.42.54 / 172.64.145.202`。内核信了污染值，把全部流量拨向那个死 IP，
@@ -2813,10 +2842,10 @@ func resolveServerIPv4(host string) []string {
 }
 
 // resolveViaControlPlaneDNS 解析代理服务器域名：
-//   1) 先问配置的 DNS（`-dns`，DoH 或 UDP）；
-//   2) 它不可用时，退而问内置 DoH 列表 —— **不要**直接退回系统解析器，那里很
-//      可能全是运营商的污染结果（在已被污染的网络里等于代理直接不可用）；
-//   3) 内置 DoH 也全挂了才由调用方退回系统解析器。
+//  1. 先问配置的 DNS（`-dns`，DoH 或 UDP）；
+//  2. 它不可用时，退而问内置 DoH 列表 —— **不要**直接退回系统解析器，那里很
+//     可能全是运营商的污染结果（在已被污染的网络里等于代理直接不可用）；
+//  3. 内置 DoH 也全挂了才由调用方退回系统解析器。
 //
 // dnsServer 为空（例如单元测试里没走 flag 解析）时跳过第 1 步。
 func resolveViaControlPlaneDNS(host string) []string {
@@ -2945,7 +2974,7 @@ func (p *ECHPool) dialWebSocketWithECH(addr string, retries int, ip string, clie
 				}
 			}
 			// 到这一步 address 里可能仍是域名：没配优选 IP 时是服务器域名，配了但填
-			// 的是「优选域名」（如 cdns.doon.eu.org）时也是域名 —— 后者同样每条连接
+			// 的是「优选域名」时也是域名 —— 后者同样每条连接
 			// 都要解析一次。统一在这里换成缓存里的 IP，net.Dialer 就跳过解析直接连，
 			// 省掉每条连接 1~2 次 DNS 往返。只改 TCP 目标地址，TLS 的 SNI / ECH 仍
 			// 用原域名，不影响证书校验与 ECH 加密。

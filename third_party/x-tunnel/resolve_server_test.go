@@ -15,9 +15,9 @@ import (
 //
 // 这个断言是防回归的：谁把 return 改回 `append(v4s, v6s...)`，这里就会红。
 func TestResolveServerIPv4NoIPv6InPool(t *testing.T) {
-	// localhost 是稳定可用的双栈样本；cdns.doon.eu.org 是真机上实际用的
-	// 优选域名（实测同时有 A 和 AAAA）。解析不到就跳过，不让离线环境挂测试。
-	for _, host := range []string{"localhost", "cdns.doon.eu.org"} {
+	// localhost 是稳定可用的双栈样本；另一个用公共双栈域（同时有 A 和 AAAA）。
+	// 解析不到就跳过，不让离线环境挂测试。
+	for _, host := range []string{"localhost", "dns.google"} {
 		ips := resolveServerIPv4(host)
 		if len(ips) == 0 {
 			t.Logf("%-20s -> 解析不到地址（离线？），跳过", host)

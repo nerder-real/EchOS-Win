@@ -242,7 +242,7 @@ class ServerConfig {
     this.serverPort = 443,
     this.listen = '127.0.0.1',
     this.listenPort = 30000,
-    this.ip = 'cdns.doon.eu.org',  // 对齐 Mac v1.2.5+ 默认优选IP
+    this.ip = '',  // 默认留空：优选域名由服务方下发；UI 占位符提示格式
     this.ech = 'cloudflare-ech.com',
     this.dns = 'dns.alidns.com/dns-query',
     this.token = '',
@@ -288,7 +288,7 @@ class ServerConfig {
       serverPort: serverPort,
       listen: listen,
       listenPort: listenPort,
-      ip: (j['ip'] as String?) ?? 'cdns.doon.eu.org',
+      ip: (j['ip'] as String?) ?? '',
       ech: (j['ech'] as String?) ?? 'cloudflare-ech.com',
       dns: (j['dns'] as String?) ?? 'dns.alidns.com/dns-query',
       token: (j['token'] as String?) ?? '',

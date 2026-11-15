@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -32,7 +31,7 @@ import (
 // 这里实现这套协议，让 EchOS 能直连这类服务端。
 
 const (
-	simpleConnectTimeout = 4 * time.Second  // 加快失败反馈
+	simpleConnectTimeout = 4 * time.Second // 加快失败反馈
 
 	// simpleFastFail 是「抢热实例」的建连阈值。
 	//
@@ -176,47 +175,95 @@ func (c *simpleWSConn) startKeepAlive() {
 	}()
 }
 
-// pickIP 从优选 IP 列表里轮流取一个，没配就返回空串（直接解析服务器域名）。
-var simpleIPCounter uint64
+// ---- 边缘粘性主选与冷却（03-边缘优选）----
+//
+// 历史教训（2026-11-15 实测后撤除连接池）：曾实现「预热池 + 借出复用」，
+// 但 CF Workers 平台在客户端首帧之前会终止空 WS 连接（约 10~20s，ctx.waitUntil
+// 也保不住）——借出 10 次全部 CONNECTED 超时，池纯负贡献，已整体撤除。
+// 保留的是与池无关、被实测验证的两件：边缘粘性主选 + 拨号失败冷却。
+const edgeFailCooldown = 60 * time.Second // 边缘拨号失败冷却
+// markEdgeFail / markEdgeOK：边缘冷却。拨号失败冷却该边缘 60s
+// （粘性主选自动跳到次位），成功即解除。两函数各持 edgeMu，并发安全。
+func (p *ECHPool) markEdgeFail(ip string) {
+	if ip == "" {
+		return
+	}
+	p.edgeMu.Lock()
+	if p.edgeFailUntil == nil {
+		p.edgeFailUntil = make(map[string]time.Time)
+	}
+	p.edgeFailUntil[ip] = time.Now().Add(edgeFailCooldown)
+	p.edgeMu.Unlock()
+}
 
+func (p *ECHPool) markEdgeOK(ip string) {
+	if ip == "" {
+		return
+	}
+	p.edgeMu.Lock()
+	delete(p.edgeFailUntil, ip)
+	p.edgeMu.Unlock()
+}
+
+// pickIP 粘性主选：取第一个不在冷却期的边缘，主选拨号失败被 markEdgeFail
+// 冷却后自动跳到次位，恢复（markEdgeOK）后回切。（03-边缘优选落地后
+// targetIPs 会按吞吐降序排列，粘住的将是吞吐冠军。）
+//
+// 全部候选都在冷却期时，退回**冷却最早到期**的边缘——它是最可能先恢复的；
+// 退回首项的话，候选被吞吐门槛剔到只剩 1~2 个时（2026-11-15 实测环境），
+// 重试会连续撞同一个边缘，故障转移名存实亡。
 func (p *ECHPool) pickIP() string {
 	if len(p.targetIPs) == 0 {
 		return ""
 	}
-	n := atomic.AddUint64(&simpleIPCounter, 1)
-	return p.targetIPs[int(n)%len(p.targetIPs)]
+	p.targetIPsMu.RLock()
+	defer p.targetIPsMu.RUnlock()
+	p.edgeMu.Lock()
+	defer p.edgeMu.Unlock()
+	best := p.targetIPs[0]
+	var bestUntil time.Time
+	for _, ip := range p.targetIPs {
+		until, bad := p.edgeFailUntil[ip]
+		if !bad || time.Now().After(until) {
+			return ip // 未冷却：直接可用
+		}
+		if bestUntil.IsZero() || until.Before(bestUntil) {
+			best, bestUntil = ip, until
+		}
+	}
+	return best
 }
 
-// dialSimpleWS 为一个目标地址开一条新的 WebSocket 并完成 CONNECT 握手。
-func dialSimpleWS(target string) (net.Conn, error) {
-	// 直连模式：每次新建 WebSocket（与 ech-wk 客户端行为一致）。
-	// 预热池（含 dialGate 并发闸门）在 CF 简易服务端下既可能发出
-	// "已被服务端悄悄关掉的死连接"，又会把并发握手限死在 6 条 ——
-	// YouTube 这种多连接大流量一上来就被卡在并发闸门上，吞吐上不去。
-	return dialSimpleWSTimeout(target, simpleConnectTimeout)
+// currentTargetIPs 返回当前候选的快照（边缘优选复测循环的输入）。
+func (p *ECHPool) currentTargetIPs() []string {
+	p.targetIPsMu.RLock()
+	defer p.targetIPsMu.RUnlock()
+	return append([]string(nil), p.targetIPs...)
 }
 
-func dialSimpleWSTimeout(target string, timeout time.Duration) (net.Conn, error) {
-	if echPool == nil {
-		return nil, errors.New("连接池未初始化")
-	}
-	t0 := time.Now()
+// setTargetIPs 原子替换候选列表（复测结果非空时调用）。
+func (p *ECHPool) setTargetIPs(ips []string) {
+	p.targetIPsMu.Lock()
+	p.targetIPs = ips
+	p.targetIPsMu.Unlock()
+}
 
-	// 完全绕过预热池与并发闸门，每次全新建连（ech-wk 等价路径）。
-	ws, err := echPool.dialWebSocketWithECH(echPool.wsServerAddr, 2, echPool.pickIP(), "", 0)
-	if err != nil {
-		return nil, err
-	}
+// simpleWSHandshake 供边缘优选（tun_iprank）使用：在一条裸 WS 上完成
+// CONNECT 握手，返回可读写的 net.Conn。与 finishSimpleConnect 同一条链，
+// 不做慢握手日志（探针自己按样本计时）。
+func simpleWSHandshake(ws *websocket.Conn, target string, timeout time.Duration) (net.Conn, error) {
+	return finishSimpleConnect(ws, target, timeout, time.Now())
+}
 
-	// 首帧留空：那个字段在服务端会过 TextEncoder，塞二进制进去必然被改写。
-	// 真正的数据等 CONNECTED 之后用二进制帧发。
+// finishSimpleConnect 在一条裸 WS 上发 CONNECT 并等 CONNECTED。
+// timeout 是等 CONNECTED 的时限（调用方按 fast-fail 语义传入）。
+// 失败时关闭 ws。
+func finishSimpleConnect(ws *websocket.Conn, target string, timeout time.Duration, t0 time.Time) (net.Conn, error) {
 	_ = ws.SetWriteDeadline(time.Now().Add(timeout))
 	if err := ws.WriteMessage(websocket.TextMessage, []byte("CONNECT:"+target+"|")); err != nil {
 		_ = ws.Close()
 		return nil, fmt.Errorf("发送 CONNECT 失败: %w", err)
 	}
-
-	// 等服务端确认。服务端在这一步可能直接回 ERROR:（目标连不上等）
 	_ = ws.SetReadDeadline(time.Now().Add(timeout))
 	for {
 		mt, data, err := ws.ReadMessage()
@@ -249,6 +296,30 @@ func dialSimpleWSTimeout(target string, timeout time.Duration) (net.Conn, error)
 			return nil, errors.New("服务端主动关闭")
 		}
 	}
+}
+
+func dialSimpleWSTimeout(target string, timeout time.Duration) (net.Conn, error) {
+	if echPool == nil {
+		return nil, errors.New("连接池未初始化")
+	}
+	t0 := time.Now()
+
+	// 全新拨号（2026-11-15 终态：连接池已撤除——CF Workers 平台在客户端
+	// 首帧之前终止空 WS 连接，预热借出模式在平台上不可行，见
+	// 「边缘粘性主选与冷却」注释块的历史教训）。
+	ip := echPool.pickIP()
+	ws, err := echPool.dialWebSocketWithECH(echPool.wsServerAddr, 2, ip, "", 0)
+	if err != nil {
+		echPool.markEdgeFail(ip)
+		return nil, err
+	}
+	conn, err := finishSimpleConnect(ws, target, timeout, t0)
+	if err != nil {
+		echPool.markEdgeFail(ip)
+		return nil, err
+	}
+	echPool.markEdgeOK(ip)
+	return conn, nil
 }
 
 // probeSimpleProtocol 探测服务端是不是这种「简易 WebSocket 代理」。

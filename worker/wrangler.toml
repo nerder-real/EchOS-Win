@@ -2,3 +2,7 @@ name = "echos-worker"
 main = "Worker-ECH.js"
 # 必须 >= 2025-09-15，否则 cloudflare:sockets 的 connect() 出站数据不通（隧道 CONNECTED 后卡死）
 compatibility_date = "2025-09-15"
+# workers.dev 子域路由（生产+预览）一律关闭：客户端只经自定义域名访问，
+# 不把 Worker 暴露在公开的 *.workers.dev 上。
+workers_dev = false
+preview_urls = false

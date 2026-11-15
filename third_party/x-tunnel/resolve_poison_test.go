@@ -19,7 +19,7 @@ func testAnswer(rtype uint16, rdata []byte) []byte {
 
 // testDNSResponse 拼一个带 question 的响应报文。
 func testDNSResponse(answers ...[]byte) []byte {
-	q := buildDNSQuery("cdns.doon.eu.org", dnsTypeA)
+	q := buildDNSQuery("probe.example.com", dnsTypeA)
 	q[2], q[3] = 0x81, 0x80 // QR=1, RD=1, RA=1
 	binary.BigEndian.PutUint16(q[6:8], uint16(len(answers)))
 	for _, a := range answers {
@@ -50,14 +50,11 @@ func cnameRData(name string) []byte {
 
 // TestParseARecordsSkipsCNAME 钉住「优选域名是 CNAME 到 CF 站点」这个真实形态：
 // 答案里第一条是 CNAME，后面才是 A 记录 —— 解析器必须跳过 CNAME 取到 A。
-//
-// 真机事故背景：cdns.doon.eu.org 实际 CNAME 到 www.nexusmods.com，
-// 正确解析是 [104.18.42.54, 172.64.145.202]；运营商 DNS 却污染成 8.134.121.112。
 func TestParseARecordsSkipsCNAME(t *testing.T) {
 	resp := testDNSResponse(
-		testAnswer(5, cnameRData("www.nexusmods.com")), // CNAME，必须被跳过
-		testAnswer(1, []byte{104, 18, 42, 54}),         // A
-		testAnswer(1, []byte{172, 64, 145, 202}),       // A
+		testAnswer(5, cnameRData("www.example-cf-site.com")), // CNAME，必须被跳过
+		testAnswer(1, []byte{104, 18, 42, 54}),               // A
+		testAnswer(1, []byte{172, 64, 145, 202}),             // A
 	)
 	got := parseARecords(resp)
 	want := []string{"104.18.42.54", "172.64.145.202"}
@@ -74,7 +71,7 @@ func TestParseARecordsSkipsCNAME(t *testing.T) {
 // TestParseARecordsAAAA 覆盖 AAAA 分支（16 字节 rdata）。
 func TestParseARecordsAAAA(t *testing.T) {
 	resp := testDNSResponse(
-		testAnswer(5, cnameRData("www.nexusmods.com")),
+		testAnswer(5, cnameRData("www.example-cf-site.com")),
 		testAnswer(28, []byte{0x26, 0x06, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}),
 	)
 	got := parseARecords(resp)

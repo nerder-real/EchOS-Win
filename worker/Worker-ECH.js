@@ -31,8 +31,11 @@ export default {
 
       const [client, server] = Object.values(new WebSocketPair());
       server.accept();
-      
-      handleSession(server).catch(() => safeCloseWebSocket(server));
+
+      // 必须挂 ctx.waitUntil：fetch 返回 101 后运行时若没有存活的引用，
+      // 会回收 isolate —— 池里借出的空连接发 CONNECT 时无响应（2026-11-15
+      // 实测借出 10 次全死）。挂上后 isolate 存活到会话结束。
+      ctx.waitUntil(handleSession(server).catch(() => safeCloseWebSocket(server)));
 
       // 修复 spread 类型错误
       const responseInit = {
@@ -56,10 +59,22 @@ async function handleSession(webSocket) {
   let remoteSocket, remoteWriter, remoteReader;
   let isClosed = false;
 
+  // 空连接应用层保活（v1.3.0 连接池配套）：客户端会把「已完成 WS 升级、
+  // 还没发 CONNECT」的连接预热在池里（TTL 20s），本端在收到 CONNECT 之前
+  // 没有任何事件 —— CF 平台对无活动的 isolate 会快速挂起/回收，实测池里
+  // 的连接借出时全部无响应。每 10s 发一条文本保活帧刷新所有空闲计时；
+  // 客户端对 CONNECTED 之前的未知文本一律忽略（simple_ws.go Read）。
+  // 收到 CONNECT / 连接关闭时停止：之后的连接已进入正常透传。
+  let idleKeepalive = setInterval(() => {
+    try { webSocket.send('PING'); } catch {}
+  }, 10000);
+  const stopIdleKeepalive = () => { clearInterval(idleKeepalive); idleKeepalive = null; };
+
   const cleanup = () => {
     if (isClosed) return;
     isClosed = true;
-    
+    stopIdleKeepalive();
+
     try { remoteWriter?.releaseLock(); } catch {}
     try { remoteReader?.releaseLock(); } catch {}
     try { remoteSocket?.close(); } catch {}
@@ -161,6 +176,8 @@ async function handleSession(webSocket) {
 
       if (typeof data === 'string') {
         if (data.startsWith('CONNECT:')) {
+          // 收到 CONNECT：连接进入正常透传，空连接保活使命完成
+          stopIdleKeepalive();
           const sep = data.indexOf('|', 8);
           await connectToRemote(
             data.substring(8, sep),

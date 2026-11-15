@@ -484,6 +484,16 @@ class AppState extends ChangeNotifier {
         proxyReady = false;
         disableSystemProxy();
       }
+      if (SystemProxy.tunCleared) {
+        // TUN 下内核意外退出：TUN 已不在，清空态失去意义，按备份还原原值。
+        SystemProxy.tunCleared = false;
+        _stopSysProxyWatch();
+        SystemProxy.restoreFromDisk().then((warns) {
+          for (final w in warns) {
+            _log('[系统代理] $w');
+          }
+        });
+      }
       checkState = const CheckState.idle();
       _refreshStatusText();
       notifyListeners();
@@ -597,6 +607,16 @@ class AppState extends ChangeNotifier {
     // 否则按钮会永久卡在「停止中」的禁用形态。
     try {
       if (proxyTakenOver && !keepSystemProxy) await disableSystemProxy();
+      if (SystemProxy.tunCleared) {
+        // TUN 清空态下停止代理：清空不该成为最终状态，按备份还原原值。
+        // （keepSystemProxy=true 的重启路径不清——restart 后自检会再清/接管。）
+        _stopSysProxyWatch();
+        SystemProxy.tunCleared = false;
+        final warns = await SystemProxy.restoreFromDisk();
+        for (final w in warns) {
+          _log('[系统代理] $w');
+        }
+      }
       await KernelManager.instance.stop();
     } finally {
       isStopping = false;
@@ -641,6 +661,14 @@ class AppState extends ChangeNotifier {
     final wasRunningBeforeStop = isRunning || isStarting;
     try {
       if (proxyTakenOver) await disableSystemProxy();
+      if (SystemProxy.tunCleared) {
+        // TUN 清空态退出：清空不该成为用户的最终状态，按备份还原原值。
+        SystemProxy.tunCleared = false;
+        final warns = await SystemProxy.restoreFromDisk();
+        for (final w in warns) {
+          _log('[系统代理] $w');
+        }
+      }
       await KernelManager.instance.stop();
     } catch (_) {}
     isRunning = false;
@@ -808,10 +836,42 @@ class AppState extends ChangeNotifier {
   // （会跟对方乒乓互写，越抢越乱）。恢复指回本工具后警告自动解除。
   Timer? _sysProxyWatch;
   bool _sysProxyStolenNotified = false;
+  // TUN 巡逻的退出口：连续 N 次清空后仍有工具抢写 → 停止自动清除并弹窗。
+  // 清了又写是无意义的乒乓（对方随时能再写），用户需要知道并自己处置。
+  int _tunClearStrikes = 0;
+  static const int _tunClearMax = 3;
   void _startSysProxyWatch() {
     _sysProxyWatch?.cancel();
     _sysProxyStolenNotified = false;
     _sysProxyWatch = Timer.periodic(const Duration(seconds: 20), (_) async {
+      // TUN 分支：系统代理应为空，被任何工具重新启用就是抢占（应用层代理
+      // 会截走本该进 TUN 的流量）。自动清除；连续 _tunClearMax 次后停止并弹窗。
+      if (tunActive) {
+        final residue = await SystemProxy.tunResidue();
+        if (residue == null) {
+          _tunClearStrikes = 0;
+          return;
+        }
+        _tunClearStrikes++;
+        if (_tunClearStrikes <= _tunClearMax) {
+          _log('[TUN] 检测到系统代理被重新设置为 $residue'
+              '（第 $_tunClearStrikes/$_tunClearMax 次）——正在清除：'
+              'TUN 由虚拟网卡接管，应用层代理会截走流量');
+          final r = await SystemProxy.clearForTun();
+          for (final w in r.warns) {
+            _log('[TUN] $w');
+          }
+          return;
+        }
+        if (_tunClearStrikes == _tunClearMax + 1) {
+          notify('系统代理已连续 $_tunClearMax 次被其他程序重新启用'
+              '（当前指向 $residue），已停止自动清除。\n\n'
+              'TUN 模式下应用层代理会截走本该进隧道的流量，网页可能打不开。\n'
+              '请关闭对应工具（常见：v2rayN / Clash），或关闭 TUN 模式。',
+              title: '系统代理被反复抢占');
+        }
+        return;
+      }
       final thief = await SystemProxy.stolenBy();
       if (thief == null) {
         if (_sysProxyStolenNotified) {
@@ -921,13 +981,32 @@ class AppState extends ChangeNotifier {
     // 这里**不再**把 autoSystemProxy 置 false。两者允许同时开着，TUN 只是让它
     // 「让位」：不接管系统代理，但配置原样保留，关掉 TUN 后还能自动恢复。
     persist();
-    if (on && proxyTakenOver) {
-      // 顺序要紧：先把系统代理还原掉，再重启内核。否则新内核起来前，系统代理
-      // 还指着旧内核的端口。
-      disableSystemProxy();
-    }
-    if (on && config.autoSystemProxy) {
-      _log('[TUN] 「自动设置系统代理」已让位 —— TUN 由虚拟网卡接管全部流量（设置保留，关闭 TUN 后自动恢复）');
+    if (on) {
+      // TUN 让位 = **清空**系统代理，不是还原备份：还原会把备份里的第三方
+      // 代理（v2rayN 的 127.0.0.1:10808）写回去，浏览器流量在应用层被它截走、
+      // 根本不进 TUN 的 IP 层接管（Mac 同病实录）。原值已由 clearForTun 备份，
+      // 关 TUN / 退出时按原值还原。不管 autoSystemProxy 开不开都要清：
+      // 注册表里可能留着任何工具的值。
+      if (proxyTakenOver) proxyTakenOver = false;
+      SystemProxy.tunCleared = false; // 重新清空前复位标记
+      _tunClearStrikes = 0;
+      SystemProxy.clearForTun().then((r) {
+        for (final w in r.warns) {
+          _log('[TUN] $w');
+        }
+        if (r.ok) _log('[TUN] 系统代理已清空（TUN 由虚拟网卡接管全部流量，原值已备份）');
+      });
+    } else if (SystemProxy.tunCleared) {
+      // 关 TUN：清空态不该成为用户的最终状态——按备份还原原值
+      // （autoSystemProxy 开着时，随后的内核重启/自检会自动接管回本工具）。
+      SystemProxy.tunCleared = false;
+      _stopSysProxyWatch();
+      SystemProxy.restoreFromDisk().then((warns) {
+        for (final w in warns) {
+          _log('[系统代理] $w');
+        }
+        _log('[系统代理] 已按备份还原 TUN 之前的系统代理设置');
+      });
     }
     _log('[TUN] TUN 模式已${on ? '开启' : '关闭'}');
     if (isRunning || isStarting) {
@@ -1106,6 +1185,16 @@ class AppState extends ChangeNotifier {
       if (isRunning && config.autoSystemProxy && !proxyTakenOver && !config.tunMode) {
         _log('[系统] 自检通过，正在接管系统代理…');
         await enableSystemProxy();
+      }
+      if (isRunning && config.tunMode) {
+        // TUN 生效期间系统代理必须为空：应用层代理会截走本该进 TUN 的流量
+        // （Mac 同病实录）。启动窗口期里 v2rayN 等可能又写了值，自检前再清
+        // 一次；同时启动 TUN 巡逻（见 _startSysProxyWatch 的 TUN 分支）。
+        final r = await SystemProxy.clearForTun();
+        for (final w in r.warns) {
+          _log('[TUN] $w');
+        }
+        _startSysProxyWatch();
       }
       return;
     }
